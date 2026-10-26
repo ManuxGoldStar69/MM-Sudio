@@ -939,6 +939,12 @@ pub struct UiState {
     /// Full-screen "Pantalla de Inicio" (MM Fotografía Home Screen).
     #[serde(skip)]
     pub show_home: bool,
+    /// Floating Welcome & Optional Donation modal window.
+    #[serde(skip)]
+    pub show_welcome_modal: bool,
+    /// Timestamp when the donation account number was copied to clipboard (for visual feedback).
+    #[serde(skip)]
+    pub welcome_account_copied_at: Option<f64>,
     /// MM Fotografía Dark Glassmorphic Studio workspace layout.
     #[serde(skip)]
     pub mm_studio: bool,
@@ -1468,6 +1474,8 @@ impl Default for UiState {
             auto_advance: false,
             fullscreen: false,
             show_home: false,
+            show_welcome_modal: false,
+            welcome_account_copied_at: None,
             mm_studio: false,
             lights_out: LightsOut::On,
             slideshow: None,

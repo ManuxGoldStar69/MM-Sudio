@@ -602,6 +602,32 @@ pub fn get(url: &Url, headers: &[(&str, String)], limits: &Limits) -> Result<Res
     Ok(Response { status, headers, conn, body })
 }
 
+/// Send `POST url` with a small JSON body and return the HTTP status code.
+pub fn post_json(url: &Url, body: &[u8], limits: &Limits) -> Result<u16, HttpError> {
+    let req_head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: MM-Studio/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        url.path,
+        url.host_header(),
+        env!("CARGO_PKG_VERSION"),
+        body.len()
+    );
+    let mut stream = Stream::connect(url, limits)?;
+    stream.write_all(req_head.as_bytes(), limits)?;
+    stream.write_all(body, limits)?;
+    let mut conn = Conn { stream, buf: Vec::new(), pos: 0 };
+    let status_line = conn.line(MAX_HEAD, limits)?;
+    let mut parts = status_line.split_whitespace();
+    let version = parts.next().unwrap_or_default();
+    if !version.starts_with("HTTP/1.") {
+        return Err(HttpError::Protocol("not an HTTP/1.x response".into()));
+    }
+    let status = parts
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| HttpError::Protocol("bad status line".into()))?;
+    Ok(status)
+}
+
 #[cfg(test)]
 mod tests_connect {
     use super::*;

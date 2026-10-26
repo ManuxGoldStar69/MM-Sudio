@@ -226,6 +226,88 @@ fn config_dir() -> Option<std::path::PathBuf> {
     lightcraft_engine::config::config_dir()
 }
 
+/// Spawns a non-blocking background thread that registers this device's anonymous installation ID
+/// (`<config>/mm-device-id`) with the MM Studio counter in `SistemaManuelCruz` (`LensFolio`).
+fn spawn_install_telemetry_ping(in_memory: bool) {
+    if in_memory || std::env::var_os("LIGHTCRAFT_NO_PREFS").is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("mm-studio-telemetry".into())
+        .spawn(|| {
+            use sha2::{Digest, Sha256};
+            let Some(cfg) = config_dir() else { return };
+            let _ = std::fs::create_dir_all(&cfg);
+            let id_path = cfg.join("mm-device-id");
+            let existing = std::fs::read_to_string(&id_path)
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| s.len() >= 16 && s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit()));
+
+            let host_hint = std::env::var("COMPUTERNAME")
+                .or_else(|_| std::env::var("HOSTNAME"))
+                .or_else(|_| std::env::var("USER"))
+                .or_else(|_| std::env::var("USERNAME"))
+                .unwrap_or_else(|_| "Device".to_string());
+
+            let device_id = if let Some(id) = existing {
+                id
+            } else {
+                let mut hasher = Sha256::new();
+                hasher.update(b"mm-studio-device-v1:");
+                hasher.update(std::env::consts::OS.as_bytes());
+                hasher.update(b":");
+                hasher.update(std::env::consts::ARCH.as_bytes());
+                hasher.update(b":");
+                hasher.update(host_hint.as_bytes());
+                hasher.update(b":");
+                hasher.update(cfg.to_string_lossy().as_bytes());
+                let digest = hasher.finalize();
+                let mut hex = String::with_capacity(32);
+                for b in digest.iter().take(16) {
+                    use std::fmt::Write;
+                    let _ = write!(&mut hex, "{b:02x}");
+                }
+                let _ = std::fs::write(&id_path, &hex);
+                hex
+            };
+
+            let clean_label: String = host_hint
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '.' | '-'))
+                .take(28)
+                .collect();
+
+            let payload = serde_json::json!({
+                "device_id": device_id,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "version": env!("CARGO_PKG_VERSION"),
+                "device_label": clean_label,
+            });
+            let Ok(body) = serde_json::to_vec(&payload) else { return };
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let limits = lightcraft_fetch::http::Limits {
+                connect: std::time::Duration::from_secs(5),
+                stall: std::time::Duration::from_secs(5),
+                cancel: &cancel,
+            };
+
+            let endpoints = [
+                "https://fotos.manuelmendiola.com/api/mm-studio/ping",
+                "https://manuelmendiola.com/api/mm-studio/ping",
+            ];
+            for ep in endpoints {
+                if let Ok(url) = lightcraft_fetch::http::Url::parse(ep)
+                    && let Ok(status) = lightcraft_fetch::http::post_json(&url, &body, &limits)
+                    && (200..300).contains(&status)
+                {
+                    break;
+                }
+            }
+        });
+}
+
 /// The window at the size it was last used at, zoomed if it was (`window`), or at the usual size
 /// when nothing is remembered. A zoomed window is given the size it goes back to. Where it
 /// opens is the system's to say.
@@ -974,12 +1056,14 @@ fn main() -> eframe::Result {
                 }
                 app.ui.mm_studio = true;
                 app.ui.show_home = true;
+                app.ui.show_welcome_modal = true;
                 app.ui.left_panel = true;
                 app.ui.presets = false;
                 if app.ui.right == lightcraft_ui_egui::state::RightPanel::None {
                     app.ui.right = lightcraft_ui_egui::state::RightPanel::Edit;
                 }
                 app.ui.open_sections = vec!["light".to_string()];
+                spawn_install_telemetry_ping(in_memory);
 
                 // Clean out default English demo albums and ensure at most a single "Inicio" test album exists on a new library
                 {

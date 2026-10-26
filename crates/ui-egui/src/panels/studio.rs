@@ -356,6 +356,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 bui.set_clip_rect(bottom_rect.expand(4.0));
                 show_bottom_bar(app, &mut bui);
             }
+
+            // 6. Floating Welcome & Optional Donation Modal (if open)
+            super::home::draw_welcome_modal(app, ui);
         });
 }
 

@@ -121,9 +121,20 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         Color32::from_rgb(218, 196, 162),
     );
 
-    // 3. Top-right circular frosted glass utility buttons (Settings & Enter Studio)
+    // 3. Top-right circular frosted glass utility buttons (Welcome/Donar, Settings & Enter Studio)
     let enter_rect = Rect::from_center_size(pos2(full.right() - pad_x, top_y + 18.0), vec2(38.0, 38.0));
     let settings_rect = Rect::from_center_size(pos2(enter_rect.left() - 28.0, top_y + 18.0), vec2(38.0, 38.0));
+    let welcome_rect = Rect::from_center_size(pos2(settings_rect.left() - 28.0, top_y + 18.0), vec2(38.0, 38.0));
+
+    let w_resp = ui
+        .interact(welcome_rect, egui::Id::new("home-welcome-btn"), Sense::click())
+        .on_hover_text("Acerca de MM Studio · Apoyar el proyecto");
+    register(ui.ctx(), "button:homeWelcome", welcome_rect);
+    paint_frosted_circle(ui.painter(), welcome_rect, w_resp.hovered());
+    paint(ui.painter(), welcome_rect.shrink(10.0), Icon::Heart, Color32::from_rgb(229, 169, 75));
+    if w_resp.clicked() {
+        app.ui.show_welcome_modal = true;
+    }
 
     let s_resp = ui
         .interact(settings_rect, egui::Id::new("home-settings-btn"), Sense::click())
@@ -141,7 +152,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     register(ui.ctx(), "button:homeEnterStudio", enter_rect);
     paint_frosted_circle(ui.painter(), enter_rect, e_resp.hovered());
     paint(ui.painter(), enter_rect.shrink(10.0), Icon::Single, Color32::from_rgb(240, 238, 232));
-    if e_resp.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if e_resp.clicked() || (!app.ui.show_welcome_modal && ui.input(|i| i.key_pressed(egui::Key::Escape))) {
         app.ui.show_home = false;
     }
 
@@ -453,6 +464,200 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     if anim < 0.999 {
         let veil_a = ((1.0 - anim) * 115.0).round().clamp(0.0, 255.0) as u8;
         ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::from_black_alpha(veil_a));
+    }
+
+    draw_welcome_modal(app, ui);
+}
+
+/// Floating closable Welcome & Optional Donation modal window.
+pub fn draw_welcome_modal(app: &mut LightcraftApp, ui: &mut egui::Ui) {
+    if !app.ui.show_welcome_modal {
+        return;
+    }
+
+    let t = Tokens::get(ui.ctx());
+    let screen = ui.max_rect();
+
+    // Backdrop veil
+    ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(158));
+
+    let modal_w = 510.0f32.min(screen.width() - 32.0);
+    let modal_h = 415.0f32.min(screen.height() - 32.0);
+    let card = Rect::from_center_size(screen.center(), vec2(modal_w, modal_h));
+
+    // Close if user presses Escape or clicks outside the card
+    let bg_resp = ui.interact(screen, egui::Id::new("welcome-modal-backdrop"), Sense::click());
+    // Absorb clicks inside the card so backdrop click only triggers outside
+    let _card_absorb = ui.interact(card, egui::Id::new("welcome-modal-card"), Sense::click());
+
+    // Frosted dark glass modal card
+    ui.painter().rect(
+        card,
+        CornerRadius::same(18),
+        Color32::from_rgba_unmultiplied(19, 21, 20, 246),
+        Stroke::new(1.0, Color32::from_white_alpha(58)),
+        StrokeKind::Inside,
+    );
+    // Warm golden top specular accent line
+    ui.painter().line_segment(
+        [pos2(card.left() + 28.0, card.top() + 1.0), pos2(card.right() - 28.0, card.top() + 1.0)],
+        Stroke::new(1.5, Color32::from_rgba_unmultiplied(229, 169, 75, 160)),
+    );
+
+    // Top-right Close (✕) button
+    let close_rect = Rect::from_center_size(pos2(card.right() - 24.0, card.top() + 24.0), vec2(28.0, 28.0));
+    let close_resp = ui
+        .interact(close_rect, egui::Id::new("welcome-modal-close"), Sense::click())
+        .on_hover_text("Cerrar ventana");
+    register(ui.ctx(), "button:welcomeClose", close_rect);
+    paint_frosted_circle(ui.painter(), close_rect, close_resp.hovered());
+    paint(ui.painter(), close_rect.shrink(8.0), Icon::Close, Color32::from_rgb(228, 224, 216));
+
+    // Top MM Logo
+    let logo_size = vec2(52.0, 52.0);
+    let logo_rect = Rect::from_center_size(pos2(card.center().x, card.top() + 44.0), logo_size);
+    if let Some(tex) = mm_logo_white_texture(ui.ctx()) {
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        ui.painter().image(tex.id(), logo_rect, uv, Color32::WHITE);
+    } else {
+        ui.painter().text(logo_rect.center(), Align2::CENTER_CENTER, "MM", t.semibold(22.0), Color32::WHITE);
+    }
+
+    // Title & Subtitle
+    ui.painter().text(
+        pos2(card.center().x, logo_rect.bottom() + 14.0),
+        Align2::CENTER_TOP,
+        "¡Muchas gracias por instalarme!",
+        t.semibold(19.0),
+        Color32::from_rgb(246, 244, 238),
+    );
+    ui.painter().text(
+        pos2(card.center().x, logo_rect.bottom() + 39.0),
+        Align2::CENTER_TOP,
+        "M M   S T U D I O   ·   M A N U E L   C R U Z   M .",
+        t.font(9.5),
+        Color32::from_rgb(229, 169, 75),
+    );
+
+    // Body paragraph
+    let body_text = "Este programa está hecho basándose en el repositorio de código abierto\n\
+LightCraft (storytold/lightcraft), pero modificado con las herramientas\n\
+que yo más priorizo: tiene mejoras en el rendimiento y una galería muy\n\
+amplia de LUTs creativos (en el área de Efectos) para disfrutar\n\
+y explotar al máximo la creatividad.";
+    ui.painter().text(
+        pos2(card.center().x, logo_rect.bottom() + 62.0),
+        Align2::CENTER_TOP,
+        body_text,
+        t.font(12.5),
+        Color32::from_rgb(212, 208, 200),
+    );
+
+    // Optional Donation Box
+    let don_box = Rect::from_min_max(
+        pos2(card.left() + 26.0, card.bottom() - 166.0),
+        pos2(card.right() - 26.0, card.bottom() - 68.0),
+    );
+    ui.painter().rect(
+        don_box,
+        CornerRadius::same(12),
+        Color32::from_rgba_unmultiplied(30, 32, 30, 220),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(229, 169, 75, 75)),
+        StrokeKind::Inside,
+    );
+
+    ui.painter().text(
+        pos2(don_box.left() + 16.0, don_box.top() + 13.0),
+        Align2::LEFT_TOP,
+        "Si gustas donar algo (No es obligatorio), te dejo mi cuenta BBVA:",
+        t.font(11.5),
+        Color32::from_rgb(218, 212, 200),
+    );
+
+    let acct_raw = ["012261", "015344", "234011"].concat();
+    let acct_display = ["0122", "6101", "5344", "2340", "11"].join(" ");
+
+    ui.painter().text(
+        pos2(don_box.left() + 16.0, don_box.top() + 36.0),
+        Align2::LEFT_TOP,
+        format!("BBVA:  {acct_display}"),
+        t.semibold(14.5),
+        Color32::from_rgb(248, 244, 234),
+    );
+    ui.painter().text(
+        pos2(don_box.left() + 16.0, don_box.top() + 60.0),
+        Align2::LEFT_TOP,
+        "Beneficiario:  Manuel Cruz M.",
+        t.font(11.5),
+        Color32::from_rgb(186, 182, 172),
+    );
+
+    // Copy account button inside donation box
+    let now = ui.input(|i| i.time);
+    let recently_copied = app
+        .ui
+        .welcome_account_copied_at
+        .is_some_and(|ts| (now - ts).abs() < 2.6);
+    if recently_copied {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
+    let copy_btn = Rect::from_min_size(pos2(don_box.right() - 142.0, don_box.top() + 34.0), vec2(126.0, 36.0));
+    let copy_resp = ui
+        .interact(copy_btn, egui::Id::new("welcome-copy-account"), Sense::click())
+        .on_hover_text("Copiar número de cuenta BBVA al portapapeles");
+    register(ui.ctx(), "button:welcomeCopyAccount", copy_btn);
+
+    let (copy_fill, copy_border, copy_label, copy_ink) = if recently_copied {
+        (
+            Color32::from_rgba_unmultiplied(46, 118, 78, 230),
+            Color32::from_rgb(110, 215, 150),
+            "✓ ¡Copiado!",
+            Color32::from_rgb(245, 255, 248),
+        )
+    } else if copy_resp.hovered() {
+        (
+            Color32::from_rgb(240, 184, 90),
+            Color32::from_white_alpha(200),
+            "Copiar cuenta",
+            Color32::from_rgb(20, 22, 20),
+        )
+    } else {
+        (
+            Color32::from_rgb(229, 169, 75),
+            Color32::from_white_alpha(150),
+            "Copiar cuenta",
+            Color32::from_rgb(20, 22, 20),
+        )
+    };
+    ui.painter().rect(copy_btn, CornerRadius::same(9), copy_fill, Stroke::new(1.0, copy_border), StrokeKind::Inside);
+    ui.painter().text(copy_btn.center(), Align2::CENTER_CENTER, copy_label, t.semibold(12.0), copy_ink);
+    if copy_resp.clicked() {
+        ui.ctx().copy_text(acct_raw);
+        app.ui.welcome_account_copied_at = Some(now);
+    }
+
+    // Bottom "Comenzar" button
+    let start_btn = Rect::from_center_size(pos2(card.center().x, card.bottom() - 34.0), vec2(190.0, 38.0));
+    let start_resp = ui
+        .interact(start_btn, egui::Id::new("welcome-start-btn"), Sense::click())
+        .on_hover_text("Cerrar bienvenida y comenzar a editar");
+    register(ui.ctx(), "button:welcomeStart", start_btn);
+    paint_frosted_pill(ui.painter(), start_btn, start_resp.hovered(), 19.0);
+    ui.painter().text(
+        start_btn.center(),
+        Align2::CENTER_CENTER,
+        "Comenzar a editar",
+        t.semibold(12.5),
+        Color32::from_rgb(244, 242, 236),
+    );
+
+    if close_resp.clicked()
+        || start_resp.clicked()
+        || ui.input(|i| i.key_pressed(egui::Key::Escape))
+        || (bg_resp.clicked() && !card.contains(bg_resp.interact_pointer_pos().unwrap_or(card.center())))
+    {
+        app.ui.show_welcome_modal = false;
     }
 }
 
