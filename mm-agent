@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+mm-agent — Ultra-Token-Efficient Agentic Bridge for MM Studio (Antigravity / Astra / AI Agents)
+
+Implements the 4-Stage Visual QA & Iterative Auto-Refinement Workflow:
+  1. `inspect`: Views the target photos as they currently are (`_before.jpg` + diagnostic metrics)
+  2. `edit`: Proposes tailored settings per photo, renders the output, re-inspects the photo to
+     verify if it looks great, keeps refining in a closed loop until approved (`score >= 91%`),
+     and marks approved photos as Edited (`Flag::Pick` + `ColorLabel::Green` + Version snapshot).
+  3. `refine`: Allows an external AI agent to fine-tune an individual photo (`--id`) after inspecting
+     its preview JPEG, re-verify it, and mark it as Edited.
+
+Usage:
+  ./mm-agent status
+  ./mm-agent inspect --target album --album "Pruebas"
+  ./mm-agent edit --target album --album "Pruebas" --style social
+  ./mm-agent refine --id 29 --exp -1.25 --highlights -94 --shadows 18 --whites -42 --blacks -22 --dehaze 10 --mark-edited
+"""
+import argparse
+import json
+import time
+import urllib.request
+from pathlib import Path
+
+BRIDGE_DIR = Path.home() / ".mm-studio"
+STATE_FILE = BRIDGE_DIR / "state.json"
+CMD_FILE = BRIDGE_DIR / "command.json"
+RES_FILE = BRIDGE_DIR / "result.json"
+QA_FILE = BRIDGE_DIR / "qa_report.json"
+
+
+def analyze_web_portfolio(url: str) -> dict:
+    """Fetches a portfolio webpage, inspects its visual tone/keywords or sample images, and returns custom DevelopSettings."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "MM-Studio-Agent/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            html = resp.read(120_000).decode("utf-8", errors="ignore").lower()
+    except Exception:
+        html = url.lower()
+
+    if any(k in html for k in ["wedding", "boda", "novia", "social", "xv", "bridal"]):
+        return {
+            "values": {
+                "light.contrast": 18.0,
+                "color.vibrance": 16.0,
+                "mixer.orange.lum": 4.0,
+                "effects.clarity": 8.0,
+            },
+            "profile_id": "lut:sf-kodak-2383-warm-102",
+            "profile_amount": 24.0,
+        }
+    if any(k in html for k in ["cinema", "film", "dark", "moody", "35mm", "kodak"]):
+        return {
+            "values": {
+                "light.contrast": 20.0,
+                "color.vibrance": 12.0,
+                "effects.clarity": 14.0,
+                "vignette.amount": -16.0,
+            },
+            "profile_id": "lut:sf-kodak-vision3-250d-107",
+            "profile_amount": 65.0,
+        }
+    return {
+        "values": {
+            "light.contrast": 16.0,
+            "color.vibrance": 12.0,
+            "effects.clarity": 10.0,
+        },
+        "profile_id": "lut:sf-kodak-2383-warm-102",
+        "profile_amount": 36.0,
+    }
+
+
+def dispatch_and_wait(payload: dict, timeout_s: float = 45.0):
+    if RES_FILE.exists():
+        try:
+            RES_FILE.unlink()
+        except OSError:
+            pass
+
+    CMD_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    steps = int(timeout_s / 0.1)
+    for _ in range(steps):
+        if RES_FILE.exists():
+            print(RES_FILE.read_text(encoding="utf-8"))
+            return
+        time.sleep(0.1)
+
+    print(json.dumps({"cmd_id": payload.get("cmd_id"), "queued": True}))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MM Studio Agentic Bridge with Visual QA Loop")
+    sub = parser.add_subparsers(dest="action")
+
+    sub.add_parser("status", help="Print compact MM Studio state (<100 tokens)")
+    sub.add_parser("qa", help="Print latest per-photo Visual QA verification report")
+
+    p_insp = sub.add_parser("inspect", help="Stage 1: View photos as they currently are before proposing edits")
+    p_insp.add_argument("--target", default="open", choices=["open", "selected", "recent", "album"])
+    p_insp.add_argument("--album", default="", help="Album name filter when --target=album")
+    p_insp.add_argument("--style", default="social", help="Style target for baseline QA comparison")
+
+    p_edit = sub.add_parser(
+        "edit",
+        help="Run 4-Stage Loop: Inspect -> Propose -> Re-Verify & Refine until optimal -> Mark Edited",
+    )
+    p_edit.add_argument("--target", default="open", choices=["open", "selected", "recent", "album"])
+    p_edit.add_argument("--album", default="", help="Album name filter when --target=album")
+    p_edit.add_argument(
+        "--style",
+        default="editorial",
+        choices=["editorial", "social", "cinema", "fineart", "reference", "web", "custom"],
+    )
+    p_edit.add_argument("--ref", default="", help="Reference photo file path")
+    p_edit.add_argument("--web", default="", help="Portfolio website URL to analyze")
+    p_edit.add_argument("--lut", default="", help="Optional LUT profile ID override (e.g. lut:sf-...)")
+    p_edit.add_argument("--lut-amount", type=float, default=0.0, help="Optional LUT intensity (0-200)")
+    p_edit.add_argument("--agent", default="Antigravity / Astra", help="Agent display name")
+
+    p_ref = sub.add_parser("refine", help="Refine a specific photo by ID, re-verify its render, and mark as Edited")
+    p_ref.add_argument("--id", type=int, required=True, help="Photo catalog ID")
+    p_ref.add_argument("--style", default="editorial")
+    p_ref.add_argument("--exp", type=float, default=None)
+    p_ref.add_argument("--contrast", type=float, default=None)
+    p_ref.add_argument("--highlights", type=float, default=None)
+    p_ref.add_argument("--shadows", type=float, default=None)
+    p_ref.add_argument("--whites", type=float, default=None)
+    p_ref.add_argument("--blacks", type=float, default=None)
+    p_ref.add_argument("--dehaze", type=float, default=None)
+    p_ref.add_argument("--wb-temp", type=float, default=None)
+    p_ref.add_argument("--wb-tint", type=float, default=None)
+    p_ref.add_argument("--clarity", type=float, default=None)
+    p_ref.add_argument("--texture", type=float, default=None)
+    p_ref.add_argument("--vignette", type=float, default=None)
+    p_ref.add_argument("--vibrance", type=float, default=None)
+    p_ref.add_argument("--saturation", type=float, default=None)
+    p_ref.add_argument("--orange-lum", type=float, default=None)
+    p_ref.add_argument("--orange-sat", type=float, default=None)
+    p_ref.add_argument("--red-sat", type=float, default=None)
+    p_ref.add_argument("--yellow-sat", type=float, default=None)
+    p_ref.add_argument("--crop", default="", help="Normalized crop rect x0,y0,x1,y1 (e.g. 0.12,0.03,0.96,0.92)")
+    p_ref.add_argument("--angle", type=float, default=None, help="Straighten angle in degrees")
+    p_ref.add_argument("--lut", default="")
+    p_ref.add_argument("--lut-amount", type=float, default=0.0)
+    p_ref.add_argument("--mark-edited", action="store_true", default=True)
+
+    args = parser.parse_args()
+    BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.action == "status" or not args.action:
+        if STATE_FILE.exists():
+            print(STATE_FILE.read_text(encoding="utf-8"))
+        else:
+            print(json.dumps({"app": "MM Studio", "running": False, "hint": "Abre MM Studio para sincronizar estado"}))
+        return
+
+    if args.action == "qa":
+        if QA_FILE.exists():
+            print(QA_FILE.read_text(encoding="utf-8"))
+        else:
+            print("[]")
+        return
+
+    cmd_id = f"cmd-{int(time.time() * 1000)}"
+
+    if args.action == "inspect":
+        payload = {
+            "cmd_id": cmd_id,
+            "action": "inspect",
+            "target": args.target,
+            "album_name": args.album,
+            "style": args.style,
+        }
+        dispatch_and_wait(payload)
+        return
+
+    if args.action == "refine":
+        custom = {}
+        if args.exp is not None:
+            custom["light.exposure"] = args.exp
+        if args.contrast is not None:
+            custom["light.contrast"] = args.contrast
+        if args.highlights is not None:
+            custom["light.highlights"] = args.highlights
+        if args.shadows is not None:
+            custom["light.shadows"] = args.shadows
+        if args.whites is not None:
+            custom["light.whites"] = args.whites
+        if args.blacks is not None:
+            custom["light.blacks"] = args.blacks
+        if args.dehaze is not None:
+            custom["effects.dehaze"] = args.dehaze
+        if args.wb_temp is not None:
+            custom["wb.temp"] = args.wb_temp
+        if args.wb_tint is not None:
+            custom["wb.tint"] = args.wb_tint
+        if args.clarity is not None:
+            custom["effects.clarity"] = args.clarity
+        if args.texture is not None:
+            custom["effects.texture"] = args.texture
+        if args.vignette is not None:
+            custom["vignette.amount"] = args.vignette
+        if args.vibrance is not None:
+            custom["color.vibrance"] = args.vibrance
+        if args.saturation is not None:
+            custom["color.saturation"] = args.saturation
+        if args.orange_lum is not None:
+            custom["mixer.orange.lum"] = args.orange_lum
+        if args.orange_sat is not None:
+            custom["mixer.orange.sat"] = args.orange_sat
+        if args.red_sat is not None:
+            custom["mixer.red.sat"] = args.red_sat
+        if args.yellow_sat is not None:
+            custom["mixer.yellow.sat"] = args.yellow_sat
+        payload = {
+            "cmd_id": cmd_id,
+            "action": "refine",
+            "photo_id": args.id,
+            "target": "selected",
+            "style": args.style,
+            "custom_values": custom,
+            "mark_edited": args.mark_edited,
+        }
+        if args.crop:
+            parts = [float(x.strip()) for x in args.crop.split(",") if x.strip()]
+            if len(parts) == 4:
+                payload["crop_rect"] = parts
+        if args.angle is not None:
+            payload["crop_angle"] = args.angle
+        if args.lut:
+            payload["profile_id"] = args.lut
+        if args.lut_amount > 0:
+            payload["profile_amount"] = args.lut_amount
+        dispatch_and_wait(payload)
+        return
+
+    if args.action == "edit":
+        payload = {
+            "cmd_id": cmd_id,
+            "action": "edit",
+            "target": args.target,
+            "album_name": args.album,
+            "style": args.style,
+            "reference_path": args.ref,
+            "portfolio_url": args.web,
+            "agent_name": args.agent,
+            "mark_edited": True,
+        }
+        if args.style == "web" and args.web:
+            web_recipe = analyze_web_portfolio(args.web)
+            payload["custom_values"] = web_recipe["values"]
+            payload["profile_id"] = args.lut or web_recipe["profile_id"]
+            payload["profile_amount"] = args.lut_amount if args.lut_amount > 0 else web_recipe["profile_amount"]
+        else:
+            if args.lut:
+                payload["profile_id"] = args.lut
+            if args.lut_amount > 0:
+                payload["profile_amount"] = args.lut_amount
+        dispatch_and_wait(payload)
+
+
+if __name__ == "__main__":
+    main()
