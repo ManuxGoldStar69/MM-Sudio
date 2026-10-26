@@ -3533,6 +3533,7 @@ dependencies = [
  "lightcraft-develop",
  "lightcraft-engine",
  "lightcraft-faces",
+ "lightcraft-fetch",
  "lightcraft-geom",
  "lightcraft-merge",
  "lightcraft-meta",

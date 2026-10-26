@@ -232,6 +232,7 @@ fn spawn_install_telemetry_ping(in_memory: bool) {
     if in_memory || std::env::var_os("LIGHTCRAFT_NO_PREFS").is_some() {
         return;
     }
+    lightcraft_ui_egui::updater::check_for_updates(false);
     let _ = std::thread::Builder::new()
         .name("mm-studio-telemetry".into())
         .spawn(|| {

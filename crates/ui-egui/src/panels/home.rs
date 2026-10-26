@@ -136,6 +136,60 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         app.ui.show_welcome_modal = true;
     }
 
+    // Optional update notification pill next to the top-right utility buttons
+    match crate::updater::status() {
+        crate::updater::UpdateStatus::Available(info) => {
+            let pill_w = 246.0;
+            let pill_rect = Rect::from_center_size(pos2(welcome_rect.left() - pill_w * 0.5 - 12.0, top_y + 18.0), vec2(pill_w, 34.0));
+            let u_resp = ui
+                .interact(pill_rect, egui::Id::new("home-update-pill"), Sense::click())
+                .on_hover_text("Haz clic para descargar e instalar la nueva actualización");
+            register(ui.ctx(), "button:homeUpdateAvailable", pill_rect);
+            let fill = if u_resp.hovered() {
+                Color32::from_rgba_unmultiplied(240, 184, 90, 235)
+            } else {
+                Color32::from_rgba_unmultiplied(229, 169, 75, 220)
+            };
+            ui.painter().rect(pill_rect, CornerRadius::same(17), fill, Stroke::new(1.0, Color32::from_white_alpha(180)), StrokeKind::Inside);
+            ui.painter().text(
+                pill_rect.center(),
+                Align2::CENTER_CENTER,
+                format!("✨ Actualizar a v{}  →", info.version),
+                t.semibold(12.0),
+                Color32::from_rgb(20, 22, 20),
+            );
+            if u_resp.clicked() {
+                app.ui.dialog = Some(crate::state::Dialog::Settings { tab: "general".into() });
+                crate::updater::start_download(info);
+            }
+        }
+        crate::updater::UpdateStatus::Downloading { info, downloaded_bytes, total_bytes } => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+            let pill_w = 246.0;
+            let pill_rect = Rect::from_center_size(pos2(welcome_rect.left() - pill_w * 0.5 - 12.0, top_y + 18.0), vec2(pill_w, 34.0));
+            let u_resp = ui
+                .interact(pill_rect, egui::Id::new("home-update-dl-pill"), Sense::click())
+                .on_hover_text("Ver progreso de descarga");
+            paint_frosted_pill(ui.painter(), pill_rect, u_resp.hovered(), 17.0);
+            let pct = if total_bytes > 0 {
+                ((downloaded_bytes as f64 / total_bytes as f64) * 100.0).round() as u32
+            } else {
+                0
+            };
+            ui.painter().text(
+                pill_rect.center(),
+                Align2::CENTER_CENTER,
+                format!("⬇ Descargando v{} ({pct}%)", info.version),
+                t.semibold(11.5),
+                Color32::from_rgb(229, 169, 75),
+            );
+            if u_resp.clicked() {
+                app.ui.dialog = Some(crate::state::Dialog::Settings { tab: "general".into() });
+            }
+        }
+        _ => {}
+    }
+
     let s_resp = ui
         .interact(settings_rect, egui::Id::new("home-settings-btn"), Sense::click())
         .on_hover_text("Ajustes de la aplicación");

@@ -113,6 +113,115 @@ fn general_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
         });
         crate::i18n::set_language(app.ui.language);
     });
+
+    heading(ui, t, "Actualizaciones");
+    let up_status = crate::updater::status();
+    row(ui, t, "Versión actual", |ui| {
+        ui.label(RichText::new(format!("MM Studio v{}", crate::updater::CURRENT_VERSION)).color(t.text));
+        let is_busy = matches!(
+            up_status,
+            crate::updater::UpdateStatus::Checking | crate::updater::UpdateStatus::Downloading { .. }
+        );
+        let btn = ui.add_enabled(!is_busy, egui::Button::new("Checar actualizaciones"));
+        register(ui.ctx(), "button:settingsCheckUpdates", btn.rect);
+        if btn.clicked() {
+            crate::updater::check_for_updates(true);
+        }
+    });
+
+    match up_status {
+        crate::updater::UpdateStatus::Idle => {}
+        crate::updater::UpdateStatus::Checking => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+            row(ui, t, "", |ui| {
+                ui.spinner();
+                ui.label(RichText::new("Buscando actualizaciones disponibles…").color(t.text_dim));
+            });
+        }
+        crate::updater::UpdateStatus::UpToDate => {
+            row(ui, t, "", |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "✓ Tienes la versión más reciente instalada (v{}).",
+                        crate::updater::CURRENT_VERSION
+                    ))
+                    .color(egui::Color32::from_rgb(110, 215, 150)),
+                );
+            });
+        }
+        crate::updater::UpdateStatus::Available(info) => {
+            row(ui, t, "", |ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(format!("✨ Nueva versión disponible: v{}", info.version))
+                            .font(t.semibold(12.5))
+                            .color(egui::Color32::from_rgb(229, 169, 75)),
+                    );
+                    if !info.notes.trim().is_empty() {
+                        ui.label(RichText::new(info.notes.trim()).size(11.0).color(t.text_dim));
+                    }
+                    ui.add_space(4.0);
+                    let dl_btn = ui.add(egui::Button::new(
+                        RichText::new(format!("⬇ Actualizar ahora a v{}", info.version)).font(t.semibold(12.0)),
+                    ));
+                    register(ui.ctx(), "button:settingsInstallUpdate", dl_btn.rect);
+                    if dl_btn.clicked() {
+                        crate::updater::start_download(info);
+                    }
+                });
+            });
+        }
+        crate::updater::UpdateStatus::Downloading {
+            info,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            row(ui, t, "", |ui| {
+                ui.vertical(|ui| {
+                    let dl_mb = downloaded_bytes as f64 / (1024.0 * 1024.0);
+                    let frac = if total_bytes > 0 {
+                        (downloaded_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let text = if total_bytes > 0 {
+                        let tot_mb = total_bytes as f64 / (1024.0 * 1024.0);
+                        format!("Descargando v{} ({dl_mb:.1} / {tot_mb:.1} MB)", info.version)
+                    } else {
+                        format!("Descargando v{} ({dl_mb:.1} MB)", info.version)
+                    };
+                    ui.add(egui::ProgressBar::new(frac).text(text).desired_width(280.0));
+                    if ui.button("Cancelar descarga").clicked() {
+                        crate::updater::cancel();
+                    }
+                });
+            });
+        }
+        crate::updater::UpdateStatus::ReadyToInstall {
+            version,
+            installer_path,
+        } => {
+            row(ui, t, "", |ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(format!("✓ Actualización v{version} descargada y lista."))
+                            .color(egui::Color32::from_rgb(110, 215, 150)),
+                    );
+                    if ui.button("Ejecutar instalador y cerrar MM Studio").clicked() {
+                        crate::updater::launch_installer(&installer_path);
+                        app.ui.quit = true;
+                    }
+                });
+            });
+        }
+        crate::updater::UpdateStatus::Error(err) => {
+            row(ui, t, "", |ui| {
+                ui.label(RichText::new(err).size(11.5).color(egui::Color32::from_rgb(235, 110, 110)));
+            });
+        }
+    }
+
     heading(ui, t, crate::i18n::tr("Library"));
     let location = match &app.session.library {
         Some(l) => l.dir.display().to_string(),
