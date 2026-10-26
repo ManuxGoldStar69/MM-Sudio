@@ -1047,6 +1047,14 @@ fn main() -> eframe::Result {
                     );
                     app.notices.clear();
                 }
+                // Keep the Presets drawer closed by default (only opens when the user clicks Presets)
+                app.ui.presets = false;
+                for grp_name in app.session.presets.iter().map(|p| p.group.clone()).collect::<std::collections::HashSet<_>>() {
+                    let key = format!("presetGroup:{grp_name}");
+                    if !app.ui.folded_sections.contains(&key) {
+                        app.ui.folded_sections.push(key);
+                    }
+                }
                 lightcraft_ui_egui::i18n::set_language(app.ui.language);
                 app.integrated_titlebar = cfg!(target_os = "macos");
                 app.notices.extend(prefs_warning);
