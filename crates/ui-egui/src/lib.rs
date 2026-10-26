@@ -1437,8 +1437,11 @@ impl LightcraftApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
     }
 
-    /// "LightCraft — <library name>" (just "LightCraft" for a library that isn't saved).
+    /// "LightCraft — <library name>" (just "LightCraft" for a library that isn't saved), or "MM Studio" in Studio mode.
     pub fn window_title(&self) -> String {
+        if self.ui.mm_studio {
+            return "MM Studio".to_string();
+        }
         match panels::settings::open_library_name(self) {
             Some(name) => format!("LightCraft — {name}"),
             None => "LightCraft".to_string(),

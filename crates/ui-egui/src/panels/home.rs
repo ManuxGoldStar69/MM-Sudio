@@ -344,24 +344,24 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         }
     }
 
-    // 6. Bottom Frosted Glass Dock: "Proyectos recientes"
+    // 6. Bottom Frosted Glass Dock: "Fotografías de prueba · Inicio"
     paint_frosted_pill(ui.painter(), dock_rect, false, 14.0);
     ui.painter().text(
         pos2(dock_rect.left() + 20.0, dock_rect.top() + 16.0),
         Align2::LEFT_TOP,
-        "Proyectos recientes",
+        "Fotografías recientes · Inicio",
         t.semibold(13.0),
         Color32::from_rgb(242, 240, 234),
     );
 
     let visible_photos = app.session.visible().to_vec();
-    let default_cards: [(&str, &str, [f32; 4]); 6] = [
-        ("Boda · Ana & Luis", "Hoy, 18:24", [0.05, 0.18, 0.38, 0.72]),
-        ("XV · Valeria", "Ayer, 12:10", [0.22, 0.25, 0.56, 0.78]),
-        ("Costa de Acapulco", "3 oct 2026", [0.40, 0.30, 0.75, 0.85]),
-        ("Detalles & Luz", "1 oct 2026", [0.15, 0.45, 0.52, 0.92]),
-        ("Evento · Salón", "28 sep 2026", [0.55, 0.18, 0.92, 0.70]),
-        ("Montañas", "25 sep 2026", [0.62, 0.08, 0.98, 0.60]),
+    let default_crops: [[f32; 4]; 6] = [
+        [0.05, 0.18, 0.38, 0.72],
+        [0.22, 0.25, 0.56, 0.78],
+        [0.40, 0.30, 0.75, 0.85],
+        [0.15, 0.45, 0.52, 0.92],
+        [0.55, 0.18, 0.92, 0.70],
+        [0.62, 0.08, 0.98, 0.60],
     ];
 
     let row_left = dock_rect.left() + 20.0;
@@ -378,7 +378,11 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         let item_rect = Rect::from_min_size(pos2(ix, item_top), vec2(item_w, img_h + 36.0));
         let img_rect = Rect::from_min_size(pos2(ix, item_top), vec2(item_w, img_h));
         let photo_id = visible_photos.get(i).copied();
-        let (fallback_title, fallback_sub, crop) = default_cards[i];
+        let crop = default_crops[i];
+        let (card_title, card_sub) = photo_id
+            .and_then(|pid| app.session.catalog.photo(pid))
+            .map(|p| (p.file_name.clone(), format!("Inicio · {}×{}", p.width, p.height)))
+            .unwrap_or_else(|| (format!("Muestra {:02}", i + 1), "Álbum Inicio".to_string()));
 
         let resp = ui
             .interact(item_rect, egui::Id::new(("home-recent-project", i)), Sense::click())
@@ -410,14 +414,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         ui.painter().text(
             pos2(ix + 2.0, img_rect.bottom() + 6.0),
             Align2::LEFT_TOP,
-            fallback_title,
+            card_title,
             t.semibold(11.5),
             Color32::from_rgb(238, 236, 230),
         );
         ui.painter().text(
             pos2(ix + 2.0, img_rect.bottom() + 21.0),
             Align2::LEFT_TOP,
-            fallback_sub,
+            card_sub,
             t.font(10.0),
             Color32::from_rgb(156, 154, 148),
         );

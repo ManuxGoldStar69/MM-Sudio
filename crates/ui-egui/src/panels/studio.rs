@@ -974,76 +974,19 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             let active_id = app.session.active();
             let ppp = ui.ctx().pixels_per_point();
 
-            // Featured Projects matching the reference + direct photo/album selection downwards (`hacia abajo`)
-            let featured = [
-                ("Boda - Ana & Luis", "328 fotos", 1usize),
-                ("XV - Valeria", "152 fotos", 4usize),
-                ("Evento - Salón", "420 fotos", 2usize),
-                ("Costa de Acapulco", "214 fotos", 10usize),
-            ];
-            for (idx, (title, sub, photo_idx)) in featured.into_iter().enumerate() {
-                let pid = vis_photos
-                    .get(photo_idx)
-                    .copied()
-                    .or_else(|| vis_photos.iter().copied().find(|&id| app.renderer.thumb(id).is_some()))
-                    .or_else(|| vis_photos.first().copied());
-                let is_sel = pid.is_some() && pid == active_id && idx == 0;
-                let (row, resp) = ui.allocate_exact_size(vec2(w, 50.0), Sense::click());
-                if is_sel || resp.hovered() {
-                    ui.painter().rect(
-                        row,
-                        CornerRadius::same(9),
-                        if is_sel { Color32::from_white_alpha(26) } else { Color32::from_white_alpha(14) },
-                        Stroke::new(1.0, Color32::from_white_alpha(if is_sel { 44 } else { 22 })),
-                        StrokeKind::Inside,
-                    );
-                }
-                let thumb_r = Rect::from_min_size(pos2(row.left() + 4.0, row.center().y - 21.0), vec2(42.0, 42.0));
-                ui.painter().rect_filled(thumb_r, CornerRadius::same(7), Color32::from_rgb(28, 30, 36));
-                if let Some(id) = pid {
-                    super::grid::request_thumb(app, id, (128.0 * ppp.min(2.0)) as usize, 6);
-                    if let Some(tex) = app.renderer.thumb(id) {
-                        ui.painter()
-                            .with_clip_rect(thumb_r)
-                            .image(tex.tex.id(), thumb_r, cover_uv(thumb_r, tex.size), Color32::WHITE);
-                    }
-                }
-                ui.painter().rect_stroke(thumb_r, CornerRadius::same(7), Stroke::new(1.0, Color32::from_white_alpha(32)), StrokeKind::Inside);
-                ui.painter().text(
-                    pos2(thumb_r.right() + 10.0, row.center().y - 8.0),
-                    Align2::LEFT_CENTER,
-                    title,
-                    t.semibold(12.2),
-                    Color32::WHITE,
-                );
-                ui.painter().text(
-                    pos2(thumb_r.right() + 10.0, row.center().y + 9.0),
-                    Align2::LEFT_CENTER,
-                    sub,
-                    t.font(11.2),
-                    Color32::from_rgb(176, 180, 190),
-                );
-                if resp.clicked()
-                    && let Some(id) = pid
-                {
-                    let _ = app.run("library.select", json!({"ids": [id.0], "mode": "replace"}));
-                }
-            }
-
             // Virtualized list of individual photos of the current album downwards (`hacia abajo`)
             let multi_sel = app.session.selection.ids.len() > 1;
             let row_h = 50.0f32;
             let gap_y = 4.0f32;
             let stride_y = row_h + gap_y;
-            let featured_h = 4.0 * stride_y;
             let total_list_h = if vis_photos.is_empty() {
                 0.0
             } else {
                 vis_photos.len() as f32 * stride_y - gap_y
             };
             let (list_rect, _) = ui.allocate_exact_size(vec2(w, total_list_h), Sense::hover());
-            let rel_min_y = (viewport.min.y - featured_h).max(0.0);
-            let rel_max_y = (viewport.max.y - featured_h).max(0.0);
+            let rel_min_y = viewport.min.y.max(0.0);
+            let rel_max_y = viewport.max.y.max(0.0);
             let first_idx = (rel_min_y / stride_y).floor().max(0.0) as usize;
             let last_idx = (((rel_max_y / stride_y).ceil().max(0.0) as usize) + 1).min(vis_photos.len());
 
@@ -1147,14 +1090,7 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 
 fn studio_album_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, w: f32, album: &lightcraft_catalog::Album, indent: f32) {
     let selected = app.session.source == LibrarySource::Album(album.id);
-    let real_count = app.session.catalog.album_count(album.id);
-    // Match reference counts for demo Travel 2026 sub-albums when empty
-    let shown_count = match (real_count, album.name.as_str()) {
-        (0, "Coastlines") => 245,
-        (0, "Deserts") => 184,
-        (0, "Mountains") => 312,
-        (n, _) => n,
-    };
+    let shown_count = app.session.catalog.album_count(album.id);
     let (r, resp) = ui.allocate_exact_size(vec2(w, 25.0), Sense::click());
     register(ui.ctx(), format!("album:{}", album.id.0), r);
     let p = ui.painter();

@@ -930,9 +930,9 @@ fn main() -> eframe::Result {
         viewport: as_remembered(egui::ViewportBuilder::default().with_title("MM Studio"), opens_as)
             .with_min_inner_size(lightcraft_ui_egui::window_place::MIN_SIZE)
             .with_drag_and_drop(true)
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false)
+            .with_fullsize_content_view(cfg!(target_os = "macos"))
+            .with_titlebar_shown(!cfg!(target_os = "macos"))
+            .with_title_shown(!cfg!(target_os = "macos"))
             .with_icon(app_icon())
             // Wayland matches the window to packaging/linux/ai.storyteller.lightcraft.desktop by this id
             .with_app_id(APP_ID),
@@ -973,13 +973,52 @@ fn main() -> eframe::Result {
                     app.ui = ui;
                 }
                 app.ui.mm_studio = true;
-                app.ui.show_home = false;
+                app.ui.show_home = true;
                 app.ui.left_panel = true;
                 app.ui.presets = false;
                 if app.ui.right == lightcraft_ui_egui::state::RightPanel::None {
                     app.ui.right = lightcraft_ui_egui::state::RightPanel::Edit;
                 }
                 app.ui.open_sections = vec!["light".to_string()];
+
+                // Clean out default English demo albums and ensure at most a single "Inicio" test album exists on a new library
+                {
+                    let demo_names = ["Mountains", "Coastlines", "Deserts", "Night Sky", "Garden", "Portfolio", "Travel 2026"];
+                    for name in demo_names {
+                        let ids: Vec<u64> = app
+                            .session
+                            .catalog
+                            .albums()
+                            .filter(|a| a.name == name)
+                            .map(|a| a.id.0)
+                            .collect();
+                        for aid in ids {
+                            let _ = app.session.execute("album.delete", &serde_json::json!({"id": aid}));
+                        }
+                    }
+                    if app.session.catalog.albums().count() == 0 {
+                        let demo_photo_ids: Vec<_> = app
+                            .session
+                            .catalog
+                            .photos()
+                            .filter(|p| p.in_library() && p.file_name.starts_with("LC0"))
+                            .map(|p| p.id)
+                            .collect();
+                        if let Ok(res) = app
+                            .session
+                            .execute("album.create", &serde_json::json!({"name": "Inicio", "addSelected": false}))
+                            && let Some(aid) = res.get("id").and_then(serde_json::Value::as_u64)
+                            && !demo_photo_ids.is_empty()
+                        {
+                            let raw_ids: Vec<u64> = demo_photo_ids.iter().map(|id| id.0).collect();
+                            let _ = app
+                                .session
+                                .execute("album.addPhotos", &serde_json::json!({"id": aid, "photoIds": raw_ids}));
+                        }
+                    }
+                    app.session.undo.clear();
+                    app.session.redo.clear();
+                }
                 // Auto-import any presets & LUTs in presets-y-luts (supports macOS .app Resources, Windows install dir, and dev workspace)
                 let bundle_presets_dir = std::env::current_exe()
                     .ok()
