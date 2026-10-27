@@ -271,8 +271,10 @@ fn fetch_latest_update_info(cancel: &AtomicBool) -> Result<Option<UpdateInfo>, S
                 .to_string();
             let (url_key, default_name) = if cfg!(target_os = "windows") {
                 ("windows_url", format!("MM-Studio-Setup-v{}.exe", ver.trim_start_matches('v')))
-            } else {
+            } else if cfg!(target_os = "macos") {
                 ("macos_url", format!("MM-Studio-macOS-v{}.dmg", ver.trim_start_matches('v')))
+            } else {
+                ("linux_url", format!("MM-Studio-Linux-amd64-v{}.deb", ver.trim_start_matches('v')))
             };
             if let Some(dl_url) = val.get(url_key).and_then(|v| v.as_str()).filter(|s| s.starts_with("https://")) {
                 return Ok(Some(UpdateInfo {
@@ -301,7 +303,13 @@ fn fetch_latest_update_info(cancel: &AtomicBool) -> Result<Option<UpdateInfo>, S
                 .unwrap_or("Nueva actualización oficial de MM Studio.")
                 .to_string();
 
-            let wanted_ext = if cfg!(target_os = "windows") { ".exe" } else { ".dmg" };
+            let wanted_ext = if cfg!(target_os = "windows") {
+                ".exe"
+            } else if cfg!(target_os = "macos") {
+                ".dmg"
+            } else {
+                ".deb"
+            };
             let mut chosen_url = String::new();
             let mut chosen_name = String::new();
 
