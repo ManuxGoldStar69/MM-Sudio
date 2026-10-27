@@ -4922,11 +4922,19 @@ fn show_special_filters_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tok
                 }
             }
 
-            // Button 2: ★ Favorites toggle
+            // Button 2: ★ Favorites toggle (never active by default; only activates when the user has >= 1 favorite and clicks it)
             let fav_count = catalog.iter().filter(|e| app.session.profile_favorites.contains(&e.id)).count();
+            if fav_count == 0 && fav_only {
+                fav_only = false;
+                ui.ctx().data_mut(|dd| dd.insert_temp(fav_only_id, false));
+            }
             let f_resp = ui
                 .interact(btn_fav, egui::Id::new("studio-sf-btn-fav"), Sense::click())
-                .on_hover_text("Mostrar solo tus Filtros Especiales favoritos (★)");
+                .on_hover_text(if fav_count == 0 {
+                    "Marca cualquier filtro con ★ para agregarlo a tus favoritos"
+                } else {
+                    "Mostrar solo tus Filtros Especiales favoritos (★)"
+                });
             ui.painter().rect(
                 btn_fav,
                 CornerRadius::same(8),
@@ -4951,7 +4959,7 @@ fn show_special_filters_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tok
                 t.semibold(9.8),
                 if fav_only { Color32::from_rgb(255, 225, 155) } else { Color32::from_rgb(220, 224, 234) },
             );
-            if f_resp.clicked() {
+            if f_resp.clicked() && fav_count > 0 {
                 fav_only = !fav_only;
                 page_offset = 0;
                 ui.ctx().data_mut(|dd| {
@@ -7645,6 +7653,13 @@ fn execute_agent_batch_edit(
 }
 
 fn show_ai_agent_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, _d: &DevelopSettings) {
+    let init_fold_id = egui::Id::new("studio-agent-init-folded");
+    if !ui.ctx().data(|dd| dd.get_temp::<bool>(init_fold_id)).unwrap_or(false) {
+        ui.ctx().data_mut(|dd| dd.insert_temp(init_fold_id, true));
+        if !app.ui.folded_sections.iter().any(|s| s == "studio:aiAgentBridge") {
+            app.ui.folded_sections.push("studio:aiAgentBridge".to_string());
+        }
+    }
     let card_folded = app.ui.section_folded("studio:aiAgentBridge");
     let target_id = egui::Id::new("studio-agent-target-idx");
     let mut target_idx = ui.ctx().data(|dd| dd.get_temp::<usize>(target_id)).unwrap_or(0);

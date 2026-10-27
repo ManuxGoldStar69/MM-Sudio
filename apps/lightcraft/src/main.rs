@@ -1140,6 +1140,20 @@ fn main() -> eframe::Result {
                         app.ui.folded_sections.push(key);
                     }
                 }
+                // Keep "Agente IA · Piloto Automático" collapsed by default on startup
+                let ai_agent_fold_key = "studio:aiAgentBridge".to_string();
+                if !app.ui.folded_sections.contains(&ai_agent_fold_key) {
+                    app.ui.folded_sections.push(ai_agent_fold_key);
+                }
+                // Ensure a clean start with 0 pre-populated favorites (resets any dev/test favorites once)
+                if let Some(cfg) = config_dir() {
+                    let clean_marker = cfg.join("mm-favs-clean-v130");
+                    if !clean_marker.exists() {
+                        app.session.profile_favorites.clear();
+                        let _ = std::fs::create_dir_all(&cfg);
+                        let _ = std::fs::write(&clean_marker, b"1");
+                    }
+                }
                 lightcraft_ui_egui::i18n::set_language(app.ui.language);
                 app.integrated_titlebar = cfg!(target_os = "macos");
                 app.notices.extend(prefs_warning);
