@@ -205,6 +205,9 @@ pub struct Renderer {
     /// Photos whose grid thumbnail is the camera's embedded preview itself (no render behind it).
     embedded_thumbs: HashMap<PhotoId, (std::sync::Weak<lightcraft_catalog::Photo>, usize, u64)>,
     pool: JobPool<Slot, Finished>,
+    /// Dedicated fast pool for stand-ins (`Slot::Preview` and `Slot::ThumbQuick`) so embedded JPEGs
+    /// and cached previews never wait behind slow RAW sensor decodes in `pool`.
+    quick_pool: Option<JobPool<Slot, Finished>>,
     /// Jobs run elsewhere (see [`RenderOffload`]); `queue` holds the ones not started yet.
     offload: Option<Box<dyn RenderOffload>>,
     queue: Vec<Queued>,
@@ -287,6 +290,7 @@ impl Renderer {
             epoch: 0,
             preview_generation: None,
             pool: JobPool::new(threads),
+            quick_pool: None,
             thumb_inputs: HashMap::new(),
             embedded_thumbs: HashMap::new(),
             offload: None,
@@ -318,6 +322,29 @@ impl Renderer {
 }
 
 impl Renderer {
+    /// Enables a dedicated fast worker pool for stand-in previews (`Slot::Preview` and `Slot::ThumbQuick`)
+    /// so stepping through photos never waits behind full RAW sensor decodes.
+    pub fn enable_fast_quick_pool(&mut self) {
+        if cfg!(not(target_arch = "wasm32")) && self.quick_pool.is_none() {
+            self.quick_pool = Some(JobPool::new(4));
+        }
+    }
+
+    /// Whether `photo` already has (or is rendering) a current thumbnail of at least `min_bucket`
+    /// pixels, so secondary strips (filmstrip, project list, bottom bar) never downgrade or thrash
+    /// a larger grid thumbnail.
+    pub fn thumb_any_size_current(&self, photo: &Arc<lightcraft_catalog::Photo>, min_bucket: usize, priority: u32) -> bool {
+        if let Some(&(ref old, size, _, _)) = self.thumb_inputs.get(&photo.id)
+            && old.as_ptr() == Arc::as_ptr(photo)
+            && size >= min_bucket
+        {
+            return self.thumb_current(photo, size, priority)
+                || self.thumb_quick_is_final(photo, size, priority)
+                || self.thumb_quick_pending(photo, size, priority);
+        }
+        false
+    }
+
     /// Would asking for this thumbnail again (at `priority`) change nothing?
     pub fn thumb_current(&self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, priority: u32) -> bool {
         let Some(&(ref old, size, key, quick)) = self.thumb_inputs.get(&photo.id) else { return false };
@@ -464,7 +491,9 @@ impl Renderer {
     }
 
     fn is_queued(&self, slot: Slot) -> bool {
-        self.queue.iter().any(|q| q.slot == slot) || self.pool.is_queued(slot)
+        self.queue.iter().any(|q| q.slot == slot)
+            || self.pool.is_queued(slot)
+            || self.quick_pool.as_ref().is_some_and(|qp| qp.is_queued(slot))
     }
 
     /// Is the slot's current texture (or pending request) already for `key`?
@@ -519,7 +548,8 @@ impl Renderer {
                 // Scrolling changes a stand-in's priority too. Keep the original closure and
                 // request identity; running or completed work must never be started again.
                 let mut queued = false;
-                self.pool.reprioritize(|s, p| {
+                let pool_ref = self.quick_pool.as_mut().unwrap_or(&mut self.pool);
+                pool_ref.reprioritize(|s, p| {
                     if *s == slot {
                         queued = true;
                         Some(priority)
@@ -536,6 +566,10 @@ impl Renderer {
         self.quick_tried.insert(slot, job.key);
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
+        if self.quick_pool.is_some() && job.embedded.is_some() {
+            // Keep the dedicated quick pool 100% free of full sensor decodes when an embedded preview exists
+            job.small = None;
+        }
         let source = job
             .small
             .as_ref()
@@ -544,7 +578,8 @@ impl Renderer {
         self.requests.insert(slot, Requested { id: job.request_id, source });
         let key = job.key;
         let display = self.display.clone();
-        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display)));
+        let pool_ref = self.quick_pool.as_mut().unwrap_or(&mut self.pool);
+        pool_ref.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display)));
     }
 
     /// Render a slideshow title screen into `slot` (once per screen key, like [`Self::request`]):
@@ -609,6 +644,9 @@ impl Renderer {
         self.epoch = lightcraft_preview::next_tick();
         self.preview_generation = None;
         self.pool.reprioritize(|_, _| None);
+        if let Some(qp) = &mut self.quick_pool {
+            qp.reprioritize(|_, _| None);
+        }
         self.thumb_inputs.clear();
         self.textures.clear();
         self.stages.clear();
@@ -628,12 +666,13 @@ impl Renderer {
     /// rendered afterwards.
     pub fn shutdown(&mut self, timeout: std::time::Duration) -> bool {
         self.queue.clear();
-        self.pool.shutdown(timeout)
+        let ok_q = self.quick_pool.as_mut().is_none_or(|qp| qp.shutdown(timeout));
+        self.pool.shutdown(timeout) && ok_q
     }
 
     /// Worker threads that are still alive (0 before the first render).
     pub fn live_workers(&self) -> usize {
-        self.pool.live_workers()
+        self.pool.live_workers() + self.quick_pool.as_ref().map_or(0, |qp| qp.live_workers())
     }
 
     /// The texture to show for a grid/filmstrip thumbnail: the rendered one, else its stand-in.
@@ -642,7 +681,7 @@ impl Renderer {
     }
 
     pub fn queued(&self) -> usize {
-        self.pool.queued() + self.queue.len()
+        self.pool.queued() + self.quick_pool.as_ref().map_or(0, |qp| qp.queued()) + self.queue.len()
     }
 
     /// Hand queued jobs to the offload (best first) while it has room.
@@ -819,6 +858,11 @@ impl Renderer {
     /// Turn finished jobs into textures. Returns true if anything changed.
     fn collect(&mut self, ctx: &egui::Context, session: &mut Session, inline_ms: f64) -> bool {
         let mut finished = Vec::new();
+        if let Some(qp) = &mut self.quick_pool {
+            while let Some(done) = qp.try_recv() {
+                finished.push((done.slot, done.result.result, done.result.color, if done.ms > 0.0 { done.ms } else { inline_ms }));
+            }
+        }
         while let Some(done) = self.pool.try_recv() {
             finished.push((done.slot, done.result.result, done.result.color, if done.ms > 0.0 { done.ms } else { inline_ms }));
         }
@@ -1021,10 +1065,16 @@ impl Renderer {
     /// thumbnail jobs for photos that scrolled out of `keep`.
     pub fn evict_thumbs(&mut self, keep: &std::collections::HashSet<PhotoId>, max: usize) {
         self.thumb_inputs.retain(|id, _| keep.contains(id));
-        let dropped = self.pool.reprioritize(|s, p| match s {
+        let mut dropped = self.pool.reprioritize(|s, p| match s {
             Slot::Thumb(id) | Slot::ThumbQuick(id) if !keep.contains(id) && p <= 11 => None,
             _ => Some(p),
         });
+        if let Some(qp) = &mut self.quick_pool {
+            dropped.extend(qp.reprioritize(|s, p| match s {
+                Slot::Thumb(id) | Slot::ThumbQuick(id) if !keep.contains(id) && p <= 11 => None,
+                _ => Some(p),
+            }));
+        }
         for s in dropped {
             self.pending.remove(&s);
             self.requests.remove(&s);

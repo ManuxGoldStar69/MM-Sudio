@@ -620,8 +620,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // copied 1:1 (no resample in the pipeline, whose prefilter and bilinear pass soften detail near
     // the output's limit) and shrunk once, by the Lanczos display fit below.
     // (zoomed in under a window render, the whole frame is hidden: it stays canvas-sized)
-    let want = if interacting || plan.window_edge.is_some() {
-        plan.main_edge
+    let want = if interacting || plan.window_edge.is_some() || app.ui.mm_studio {
+        plan.main_edge.min(texture_side.max(crate::state::MIN_TEXTURE_SIDE))
     } else {
         // (a user's explicit Preview size below the preview level still caps it)
         let limit = if app.ui.settings.preview_limit == 0 { usize::MAX } else { app.ui.settings.preview_limit as usize };
@@ -636,12 +636,48 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // hover and before renders are stand-ins: the preview size is plenty and keeps them cheap
     let se = app.ui.settings.stand_in_edge(want, texture_side);
     let (sw, sh) = if aspect >= 1.0 { (se, short(se, aspect)) } else { (short(se, 1.0 / aspect), se) };
-    if let Some(job) = app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool) {
+
+    // Request the fast stand-in (`Slot::Preview`: embedded camera JPEG or cached render) FIRST,
+    // before `Slot::Main`, so stepping through photos displays the preview in ~5ms without waiting
+    // behind full RAW sensor decodes.
+    if app.renderer.textures.get(&Slot::Main).is_none_or(|t| t.photo != id)
+        && let Some(q) = app.session.quick_view_job(id, want.max(8), !crop_tool)
+    {
+        app.renderer.request_quick(Slot::Preview, q, 110);
+    }
+
+    // In MM Studio, debounce heavy full-sensor RAW decodes by 160ms while the user is rapidly
+    // stepping through photos (`←` / `→` or clicking in filmstrip/sidebar), just like Lightroom's
+    // Fast Embedded Preview workflow.
+    let stepping_fast = if app.ui.mm_studio && !interacting {
+        let last_id_key = egui::Id::new("mm-detail-last-photo-id");
+        let last_t_key = egui::Id::new("mm-detail-last-photo-time");
+        let prev_id = ui.ctx().data(|dd| dd.get_temp::<u64>(last_id_key));
+        let mut switch_t = ui.ctx().data(|dd| dd.get_temp::<f64>(last_t_key)).unwrap_or(now);
+        if prev_id != Some(id.0) {
+            switch_t = now;
+            ui.ctx().data_mut(|dd| {
+                dd.insert_temp(last_id_key, id.0);
+                dd.insert_temp(last_t_key, switch_t);
+            });
+        }
+        let elapsed = (now - switch_t).max(0.0);
+        if elapsed < 0.16 && (app.renderer.thumb(id).is_some() || app.renderer.textures.get(&Slot::Preview).is_some_and(|t| t.photo == id)) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((0.165 - elapsed).max(0.016)));
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !stepping_fast && let Some(job) = app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool) {
         let job = if interacting { job.draft() } else { job };
         // at rest the render is shrunk to exactly the size it is drawn at with a Lanczos filter on
         // the worker, so the window draws it texel for texel instead of shrinking it with 2-tap
         // sampling (the render is up to a 64 px step larger, or the preview level)
-        let job = if interacting { job } else { job.with_display_fit(fit_px[0], fit_px[1]) };
+        let job = if interacting || app.ui.mm_studio { job } else { job.with_display_fit(fit_px[0], fit_px[1]) };
         let job = job.with_overlay(overlay).with_proof(app.ui.soft_proof.then_some(app.ui.proof));
         let job = job.with_hidden_grading(app.ui.grading_hidden_for(id));
         app.renderer.request(Slot::Main, job, 100);
@@ -660,7 +696,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let hover_key = match app.hover_preview.clone() {
         Some(h) if !interacting => app.session.preview_job(id, sw.max(8), sh.max(8), !crop_tool, &h.settings).map(|job| {
             // (the same display fit as the After view, drawn texel for texel like it)
-            let job = job.with_display_fit(fit_px[0], fit_px[1]);
+            let job = if app.ui.mm_studio { job } else { job.with_display_fit(fit_px[0], fit_px[1]) };
             let key = job.key;
             app.renderer.request(Slot::Hover, job, 105);
             (key, h.label)
@@ -669,14 +705,19 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     };
     // once this photo is on screen: prepare its neighbours in filmstrip order (source decoded and
     // kept, view render cached) so stepping to them is instant
-    if !interacting && !app.renderer.is_pending(Slot::Main) && app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.photo == id) {
-        let ids = app.session.visible_cloned();
+    if !stepping_fast && !interacting && !app.renderer.is_pending(Slot::Main) && app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.photo == id) {
+        let (_, ids) = app.session.visible_shared();
         if let Some(i) = ids.iter().position(|p| *p == id) {
             let next = ids.get(i + 1).copied();
             let prev = i.checked_sub(1).and_then(|j| ids.get(j)).copied();
             for (n, nid) in [next, prev].into_iter().enumerate() {
                 let Some(nid) = nid else { continue };
                 let Some(np) = app.session.catalog.photo(nid).cloned() else { continue };
+                if app.ui.mm_studio && app.session.embedded_thumb_is_final(&np) {
+                    // For unedited RAW neighbours in MM Studio, the embedded camera JPEG loads in ~5ms
+                    // on the dedicated quick pool; skip background 50MB RAW sensor demosaicing.
+                    continue;
+                }
                 let nf = Frame::with_lens(np.width.max(1) as usize, np.height.max(1) as usize, &np.develop, !crop_tool, np.embedded_lens.as_ref());
                 let na = nf.aspect() as f32;
                 let nr = fit_rect(main_area, na, app.ui.zoom, output_px(&nf), ppp, app.ui.pan);
@@ -688,12 +729,6 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 }
             }
         }
-    }
-    // until the loupe has this photo: show its cached render / embedded preview / a thumbnail
-    if app.renderer.textures.get(&Slot::Main).is_none_or(|t| t.photo != id)
-        && let Some(q) = app.session.quick_view_job(id, want.max(8), !crop_tool)
-    {
-        app.renderer.request_quick(Slot::Preview, q, 110);
     }
     let show_before = app.ui.before_after == BeforeAfter::Original || ui.input(|i| i.key_down(egui::Key::Backslash));
     if (split || show_before || split_view)

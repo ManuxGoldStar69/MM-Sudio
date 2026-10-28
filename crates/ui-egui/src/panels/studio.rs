@@ -34,17 +34,30 @@ use crate::widgets::{BAND_COLORS, hex, register, stars};
 /// Ensures that if the current source/album has visible photos and either no photo is active
 /// or the active photo is not in the visible list, the first visible photo is automatically selected.
 pub fn ensure_active_photo(app: &mut LightcraftApp) {
-    let active_in_visible = app
-        .session
-        .active()
-        .is_some_and(|id| app.session.visible().contains(&id));
+    let active = app.session.active();
+    let (_, vis) = app.session.visible_shared();
+    let active_in_visible = active.is_some_and(|id| vis.contains(&id));
     if !active_in_visible {
-        if let Some(&first) = app.session.visible().first() {
+        if let Some(&first) = vis.first() {
             let _ = app.run("library.select", json!({"ids": [first.0], "mode": "replace"}));
-        } else if app.session.active().is_some() {
+        } else if active.is_some() {
             let _ = app.run("library.select", json!({"ids": [], "mode": "replace"}));
         }
     }
+}
+
+/// Requests a studio sidebar/filmstrip/bar thumbnail using a unified 256px bucket
+/// and reusing any larger existing thumbnail (`384`/`512`) so `thumb_inputs` never thrashes
+/// across different bucket sizes on the same frame.
+fn request_studio_thumb(app: &mut LightcraftApp, id: PhotoId, ppp: f32, priority: u32) {
+    let size = (128.0 * ppp.clamp(1.0, 2.0)) as usize;
+    let bucket = lightcraft_engine::media::thumb_bucket(size);
+    if let Some(photo) = app.session.catalog.photo(id)
+        && app.renderer.thumb_any_size_current(photo, bucket, priority)
+    {
+        return;
+    }
+    super::grid::request_thumb(app, id, size, priority);
 }
 
 /// Computes a smooth 220ms cubic ease-out progress (`0.0..=1.0`) whenever `screen_key` changes.
@@ -68,26 +81,9 @@ pub fn screen_transition_progress(ctx: &egui::Context, screen_key: &str) -> f32 
     1.0 - (1.0 - raw).powi(3)
 }
 
-/// Computes a subtle 150ms cross-dissolve progress (`0.0..=1.0`) when switching active photos.
-fn photo_transition_progress(ctx: &egui::Context, active: Option<PhotoId>) -> f32 {
-    let key_id = egui::Id::new("mm-photo-trans-id");
-    let time_id = egui::Id::new("mm-photo-trans-time");
-    let now = ctx.input(|i| i.time);
-    let cur = active.map(|p| p.0).unwrap_or(0);
-    let prev = ctx.data(|d| d.get_temp::<u64>(key_id));
-    let mut start = ctx.data(|d| d.get_temp::<f64>(time_id)).unwrap_or(now);
-    if prev != Some(cur) {
-        start = now;
-        ctx.data_mut(|d| {
-            d.insert_temp(key_id, cur);
-            d.insert_temp(time_id, start);
-        });
-    }
-    let raw = ((now - start).max(0.0) as f32 / 0.15).clamp(0.0, 1.0);
-    if raw < 1.0 {
-        ctx.request_repaint();
-    }
-    1.0 - (1.0 - raw).powi(3)
+/// Instant 0ms photo switch (`1.0`) like Adobe Lightroom so stepping through photos has zero fade delay or artificial repaint overhead.
+fn photo_transition_progress(_ctx: &egui::Context, _active: Option<PhotoId>) -> f32 {
+    1.0
 }
 
 /// Synthesizes and caches the blurred ambient glass backdrop texture (`128×80`) so every card
@@ -593,8 +589,13 @@ fn show_topbar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 let p = ui.painter();
                 p.circle_filled(avatar_r.center(), 17.0, Color32::from_rgb(56, 52, 48));
                 // Draw portrait avatar from active/first photo or stylized photographer portrait
-                if let Some(id) = app.session.active().or_else(|| app.session.visible().first().copied()) {
-                    super::grid::request_thumb(app, id, 128, 4);
+                let avatar_photo = app
+                    .session
+                    .active()
+                    .or_else(|| app.session.visible_shared().1.first().copied());
+                if let Some(id) = avatar_photo {
+                    let ppp = ui.ctx().pixels_per_point();
+                    request_studio_thumb(app, id, ppp, 4);
                     if let Some(tex) = app.renderer.thumb(id) {
                         let inner = avatar_r.shrink(2.0);
                         p.with_clip_rect(inner).image(tex.tex.id(), inner, cover_uv(inner, tex.size), Color32::WHITE);
@@ -973,7 +974,7 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         .show_viewport(&mut proj_ui, |ui, viewport| {
             ui.spacing_mut().item_spacing.y = 4.0;
             let w = ui.available_width();
-            let vis_photos = app.session.visible_cloned();
+            let (_, vis_photos) = app.session.visible_shared();
             let active_id = app.session.active();
             let ppp = ui.ctx().pixels_per_point();
 
@@ -1026,7 +1027,7 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 }
                 let thumb_r = Rect::from_min_size(pos2(row.left() + 4.0, row.center().y - 21.0), vec2(42.0, 42.0));
                 ui.painter().rect_filled(thumb_r, CornerRadius::same(7), Color32::from_rgb(28, 30, 36));
-                super::grid::request_thumb(app, id, (128.0 * ppp.min(2.0)) as usize, 6);
+                request_studio_thumb(app, id, ppp, 6);
                 if let Some(tex) = app.renderer.thumb(id) {
                     ui.painter()
                         .with_clip_rect(thumb_r)
@@ -1093,7 +1094,13 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 
 fn studio_album_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, w: f32, album: &lightcraft_catalog::Album, indent: f32) {
     let selected = app.session.source == LibrarySource::Album(album.id);
-    let shown_count = app.session.catalog.album_count(album.id);
+    let now = (app.session.clock)();
+    let shown_count = app
+        .caches
+        .album_counts(&app.session.catalog, &now)
+        .get(&album.id)
+        .copied()
+        .unwrap_or(0);
     let (r, resp) = ui.allocate_exact_size(vec2(w, 25.0), Sense::click());
     register(ui.ctx(), format!("album:{}", album.id.0), r);
     let p = ui.painter();
@@ -1651,7 +1658,7 @@ fn show_bottom_filmstrip(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 let is_active = Some(id) == active;
                 let is_selected = app.session.selection.contains(id);
 
-                super::grid::request_thumb(app, id, (192.0 * ppp.min(2.0)) as usize, 6);
+                request_studio_thumb(app, id, ppp, 6);
                 let p = ui.painter();
                 p.rect_filled(thumb_r, CornerRadius::same(7), Color32::from_rgb(24, 27, 33));
                 if let Some(tex) = app.renderer.thumb(id) {
@@ -1735,7 +1742,8 @@ fn show_bottom_bar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let thumb_r = Rect::from_min_size(pos2(full.left() + 10.0, cy - 19.0), vec2(38.0, 38.0));
     ui.painter().rect_filled(thumb_r, CornerRadius::same(8), Color32::from_rgb(26, 28, 34));
     if let Some(id) = active_id {
-        super::grid::request_thumb(app, id, 128, 6);
+        let ppp = ui.ctx().pixels_per_point();
+        request_studio_thumb(app, id, ppp, 6);
         if let Some(tex) = app.renderer.thumb(id) {
             ui.painter()
                 .with_clip_rect(thumb_r)
@@ -6036,49 +6044,66 @@ fn agent_bridge_dir() -> std::path::PathBuf {
 
 /// Token-efficient state synchronization & zero-latency command polling for Antigravity, Astra, or any external AI agent.
 fn poll_and_sync_agent_bridge(app: &mut LightcraftApp, ctx: &egui::Context) {
-    ctx.request_repaint_after(std::time::Duration::from_millis(450));
+    let bridge_open = !app.ui.section_folded("studio:aiAgentBridge");
+    if bridge_open {
+        ctx.request_repaint_after(std::time::Duration::from_millis(900));
+    }
     let now = ctx.input(|i| i.time);
     let last_poll_id = egui::Id::new("studio-agent-last-poll");
     let last_poll = ctx.data(|d| d.get_temp::<f64>(last_poll_id)).unwrap_or(0.0);
-    if now - last_poll < 0.40 {
+    let poll_interval = if bridge_open { 0.85 } else { 2.5 };
+    if now - last_poll < poll_interval {
         return;
     }
     ctx.data_mut(|d| d.insert_temp(last_poll_id, now));
 
     let dir = agent_bridge_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    let dir_init_id = egui::Id::new("studio-agent-dir-created");
+    if !ctx.data(|d| d.get_temp::<bool>(dir_init_id).unwrap_or(false)) {
+        let _ = std::fs::create_dir_all(&dir);
+        ctx.data_mut(|d| d.insert_temp(dir_init_id, true));
+    }
 
     // 1. Export ultra-compact state.json (economizes tokens when an AI agent inspects MM Studio)
     let active_id = app.session.active().map(|p| p.0);
-    let active_name = app
-        .session
-        .active()
-        .and_then(|id| app.session.catalog.photo(id))
-        .map(|p| p.file_name.clone())
-        .unwrap_or_default();
-    let selected_ids: Vec<u64> = app.session.selected().into_iter().map(|p| p.0).collect();
-    let vis_ids: Vec<u64> = app.session.visible_cloned().into_iter().take(60).map(|p| p.0).collect();
-
-    let mut albums_compact = Vec::new();
-    let kids = app.session.catalog.album_children_by_parent();
-    for list in kids.values() {
-        for alb in list {
-            if !alb.folder {
-                let c = app.session.catalog.album_count(alb.id);
-                albums_compact.push(json!({
-                    "id": alb.id.0,
-                    "name": alb.name,
-                    "count": c
-                }));
-            }
-        }
-    }
-
+    let (vis_gen, vis_shared) = app.session.visible_shared();
     let state_hash_id = egui::Id::new("studio-agent-state-sig");
-    let sig = format!("{:?}-{:?}-{}-{}", active_id, selected_ids, vis_ids.len(), albums_compact.len());
+    let sig = format!(
+        "{:?}-{}-{}-{}-{}",
+        active_id,
+        app.session.selection.ids.len(),
+        vis_gen,
+        vis_shared.len(),
+        app.session.catalog.revision
+    );
     let prev_sig = ctx.data(|d| d.get_temp::<String>(state_hash_id)).unwrap_or_default();
     if sig != prev_sig {
         ctx.data_mut(|d| d.insert_temp(state_hash_id, sig));
+        let active_name = app
+            .session
+            .active()
+            .and_then(|id| app.session.catalog.photo(id))
+            .map(|p| p.file_name.clone())
+            .unwrap_or_default();
+        let selected_ids: Vec<u64> = app.session.selected().into_iter().map(|p| p.0).collect();
+        let vis_ids: Vec<u64> = vis_shared.iter().take(60).map(|p| p.0).collect();
+
+        let now_str = (app.session.clock)();
+        let counts = app.caches.album_counts(&app.session.catalog, &now_str).clone();
+        let mut albums_compact = Vec::new();
+        let kids = app.session.catalog.album_children_by_parent();
+        for list in kids.values() {
+            for alb in list {
+                if !alb.folder {
+                    let c = counts.get(&alb.id).copied().unwrap_or(0);
+                    albums_compact.push(json!({
+                        "id": alb.id.0,
+                        "name": alb.name,
+                        "count": c
+                    }));
+                }
+            }
+        }
         let compact_state = json!({
             "app": "MM Studio",
             "active_id": active_id,

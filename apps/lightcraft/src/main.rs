@@ -1052,6 +1052,7 @@ fn main() -> eframe::Result {
                 // HDR display: SDR unless the surface, platform and display all allow HDR
                 hdr_display::report(cc.wgpu_render_state.as_ref().map(|r| r.target_format));
                 let mut app = LightcraftApp::new(session, services(cc, app_log_file.as_deref()));
+                app.renderer.enable_fast_quick_pool();
                 if let Some(ui) = prefs {
                     app.ui = ui;
                 }
