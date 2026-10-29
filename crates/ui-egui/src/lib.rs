@@ -1481,6 +1481,9 @@ impl LightcraftApp {
             self.end_frame(&ctx, t0);
             return;
         }
+        if self.ui.mm_studio && self.ui.show_home {
+            panels::studio::poll_and_sync_agent_bridge(self, &ctx);
+        }
         if self.ui.show_home {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 15, 18)))

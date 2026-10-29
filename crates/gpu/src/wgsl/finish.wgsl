@@ -498,6 +498,80 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             e = refine_saturation(e0, e, rs);
         }
     }
+    if (pu(F_OVL) != 0u) {
+        let fw = pf(F_VIG_VIEW + 2u);
+        let fh = pf(F_VIG_VIEW + 3u);
+        let nx = (pf(F_VIG_VIEW) + f32(x) + 0.5) / fw;
+        let ny = (pf(F_VIG_VIEW + 1u) + f32(y) + 0.5) / fh;
+        let ovl_amt = pf(F_OVL_PARAMS);
+        let cos_a = pf(F_OVL_PARAMS + 1u);
+        let sin_a = pf(F_OVL_PARAMS + 2u);
+        let inv_sc = pf(F_OVL_PARAMS + 3u);
+        let sh_x = pf(F_OVL_PARAMS + 4u);
+        let sh_y = pf(F_OVL_PARAMS + 5u);
+        let prot_c = pf(F_OVL_PARAMS + 6u);
+        let dx = nx - 0.5 - sh_x;
+        let dy = ny - 0.5 - sh_y;
+        let rx = (dx * cos_a + dy * sin_a) * inv_sc;
+        let ry = (-dx * sin_a + dy * cos_a) * inv_sc;
+        var u = rx + 0.5;
+        var v = ry + 0.5;
+        if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
+            let flip = pu(F_OVL_FLIP);
+            if ((flip & 1u) != 0u) {
+                u = 1.0 - u;
+            }
+            if ((flip & 2u) != 0u) {
+                v = 1.0 - v;
+            }
+            let side = 192.0;
+            let side_u = 192u;
+            let fx = clamp(u * (side - 1.0), 0.0, side - 1.0001);
+            let fy = clamp(v * (side - 1.0), 0.0, side - 1.0001);
+            let x0 = u32(fx);
+            let y0 = u32(fy);
+            let tx = fx - f32(x0);
+            let ty = fy - f32(y0);
+            let base = pu(F_OVL_OFF);
+            let i00 = base + (y0 * side_u + x0) * 3u;
+            let i10 = base + (y0 * side_u + x0 + 1u) * 3u;
+            let i01 = base + ((y0 + 1u) * side_u + x0) * 3u;
+            let i11 = base + ((y0 + 1u) * side_u + x0 + 1u) * 3u;
+            var ov = vec3<f32>(0.0);
+            for (var c_i = 0u; c_i < 3u; c_i++) {
+                let top = aux[i00 + c_i] * (1.0 - tx) + aux[i10 + c_i] * tx;
+                let bot = aux[i01 + c_i] * (1.0 - tx) + aux[i11 + c_i] * tx;
+                ov[c_i] = sqrt(max(top * (1.0 - ty) + bot * ty, 0.0));
+            }
+            let cd = sqrt((nx - 0.5) * (nx - 0.5) + (ny - 0.5) * (ny - 0.5)) * 2.0;
+            let protect = 1.0 - prot_c * 0.82 * (1.0 - sstep(0.18, 0.85, cd));
+            let k = clamp(ovl_amt * protect, 0.0, 1.0);
+            if (k > 1e-4) {
+                let blend_m = pu(F_OVL_BLEND);
+                for (var c_i = 0u; c_i < 3u; c_i++) {
+                    let b_v = clamp(e[c_i], 0.0, 1.0);
+                    let s_v = clamp(ov[c_i] * k, 0.0, 1.2);
+                    let s_m = min(s_v, 1.0);
+                    var res = b_v;
+                    if (blend_m == 0u) {
+                        res = 1.0 - (1.0 - b_v) * (1.0 - s_m);
+                    } else if (blend_m == 1u) {
+                        let sl = (1.0 - 2.0 * s_m) * b_v * b_v + 2.0 * s_m * b_v;
+                        res = b_v + (sl - b_v) * 0.85 + s_v * 0.35;
+                    } else if (blend_m == 2u) {
+                        res = min(b_v + s_v * 0.90, 1.0);
+                    } else {
+                        var ov_b = 2.0 * b_v * s_m;
+                        if (b_v >= 0.5) {
+                            ov_b = 1.0 - 2.0 * (1.0 - b_v) * (1.0 - s_m);
+                        }
+                        res = b_v * (1.0 - k * 0.65) + ov_b * (k * 0.65) + s_v * 0.25;
+                    }
+                    e[c_i] = clamp(res, 0.0, 1.0);
+                }
+            }
+        }
+    }
     if (pu(F_GRAIN) != 0u) {
         let px = f32(x) + 0.5;
         let py = f32(y) + 0.5;

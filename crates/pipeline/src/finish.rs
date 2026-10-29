@@ -183,6 +183,8 @@ pub struct FinishParams {
     pub ev: f32,
     /// Grain: amount, cell size (px), roughness, seed.
     pub grain: Option<(f32, f32, f32, u32)>,
+    /// High-resolution optical/creative overlay plan (Light Leaks, Bokeh, Sunbeams, Prism, Cinema).
+    pub overlay: Option<crate::overlays::OverlayPlan>,
     /// Output px → normalized oriented coordinates.
     pub out_to_norm: lightcraft_geom::Affine,
     pub ow: f64,
@@ -250,6 +252,7 @@ impl FinishParams {
             gain,
             ev,
             grain,
+            overlay: if effects { crate::overlays::OverlayPlan::from_settings(&s.overlay) } else { None },
             out_to_norm: frame.out_to_norm(w, h),
             ow: frame.ow,
             oh: frame.oh,
@@ -636,6 +639,11 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 if fp.refine_sat < 1.0 {
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
+            }
+            if let Some(ovl) = &fp.overlay {
+                let nx = (vx + x as f32 + 0.5) / vw;
+                let ny = (vy + y as f32 + 0.5) / vh;
+                e = ovl.apply_srgb(e, nx, ny);
             }
             if let Some((amt, cell, rough, seed)) = *grain {
                 let n = out_to_norm.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));

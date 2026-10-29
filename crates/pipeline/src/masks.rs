@@ -279,26 +279,44 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
             }
         }
         MaskShape::Sky => {
-            // Classical sky heuristic until the segmenter lands (M12): bright, smooth, blue-ish or
-            // unsaturated, and connected to the top of the frame.
+            // Edge-aware sky segmentation: bright, smooth, blue-ish or cloud-neutral, connected
+            // to the upper frame, rejecting green foliage and warm foreground objects, refined
+            // with a cross-guided filter against log-luminance so tree branches and roofs stay crisp.
             let m = frame.out_to_norm(w, h);
             for (i, v) in out.data.iter_mut().enumerate() {
                 let (x, y) = (i % w, i / w);
                 let n = m.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
                 let c = img.data[i].map(|v| v * gain);
                 let l = log_l.data[i] + ev;
+                let lab = lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(c));
                 let blue = (c[2] - c[0]).max(0.0) / (c[2] + 1e-4);
                 let top = 1.0 - smooth(0.25, 0.7, n.y as f32);
-                *v = top * smooth(-3.5, -1.0, l) * (0.4 + 0.6 * smooth(0.0, 0.3, blue).max(smooth(0.0, 1.5, l)));
+                // Reject strong foliage greens (negative a, positive b) and warm skin/terracotta
+                let foliage = smooth(-0.015, -0.045, lab[1]) * smooth(0.018, 0.055, lab[2]);
+                let warm_fg = smooth(0.028, 0.065, lab[1]) * smooth(0.030, 0.075, lab[2]);
+                let non_sky_penalty = (1.0 - 0.88 * foliage) * (1.0 - 0.75 * warm_fg);
+                let sky_cue = (0.4 + 0.6 * smooth(0.0, 0.3, blue).max(smooth(0.0, 1.5, l))) * non_sky_penalty;
+                *v = top * smooth(-3.5, -1.0, l) * sky_cue;
             }
-            smooth_plane(&mut out, 0.01 * frame_px(frame, w));
+            let sigma = (0.008 * frame_px(frame, w)).clamp(1.5, 10.0);
+            out = guided_cross(log_l, &out, sigma, 0.0025);
         }
         MaskShape::Object { seg, detail, edge, .. } | MaskShape::Prompt { seg, detail, edge, .. } if seg.is_some() || !detail.is_empty() => {
             // Edge: below 0 a steeper transition (up to 8× the logits), above 0 feathered (up to
-            // 2 % of the long edge, so previews and exports match)
+            // 2 % of the long edge, so previews and exports match), plus edge-aware guided matting
+            // so 288×288 SAM-3 logits snap to full-resolution hair, fabric, and object contours.
             let e = (*edge / 100.0).clamp(-1.0, 1.0) as f32;
             let gain = if e < 0.0 { 1.0 - 7.0 * e } else { 1.0 };
             sample_seg(seg.as_ref(), detail, gain, frame, w, h, &mut out);
+            let r_guide = (0.0045 * frame_px(frame, w)).clamp(1.5, 7.0);
+            let guided = guided_cross(log_l, &out, r_guide, 0.0018);
+            for (v, &g) in out.data.iter_mut().zip(&guided.data) {
+                let raw = *v;
+                // Snap boundary transition band (0.02..0.98) to image edges while preserving solid cores
+                let band = 4.0 * raw * (1.0 - raw);
+                let mixed = raw * (1.0 - 0.78 * band) + g * (0.78 * band);
+                *v = if e <= 0.0 { smooth(0.08, 0.92, mixed) } else { mixed.clamp(0.0, 1.0) };
+            }
             if e > 0.0 {
                 smooth_plane(&mut out, e * 0.02 * frame_px(frame, w));
             }
@@ -639,15 +657,21 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
             if !faces.is_empty() {
                 evaluate_portrait_subject_or_clothes(&faces, img, log_l, w, h, gain, frame, false, &mut out);
             } else {
-                // Saliency + border background color contrast with edge-preserving guided filter
+                // Multi-cue saliency + 2nd-nearest border OkLab background contrast + fine texture
+                // detail + edge-preserving guided filter for objects, rings, bouquets, pets, and products.
                 let m = frame.out_to_norm(w, h);
-                let blur = lightcraft_raster::blur::gaussian(log_l, 0.03 * frame_px(frame, w));
-                let mut border_labs = Vec::with_capacity(64);
-                let step_x = (w / 12).max(1);
-                let step_y = (h / 12).max(1);
+                let blur_coarse = lightcraft_raster::blur::gaussian(log_l, (0.035 * frame_px(frame, w)).max(2.0));
+                let blur_fine = lightcraft_raster::blur::gaussian(log_l, (0.006 * frame_px(frame, w)).max(1.0));
+                let mut border_labs = Vec::with_capacity(96);
+                let step_x = (w / 14).max(1);
+                let step_y = (h / 14).max(1);
                 for bx in (0..w).step_by(step_x) {
                     let c_top = img.data[bx].map(|v| v * gain);
                     border_labs.push(lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(c_top)));
+                    if h > 1 {
+                        let c_bot = img.data[(h - 1) * w + bx].map(|v| v * gain);
+                        border_labs.push(lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(c_bot)));
+                    }
                 }
                 for by in (0..h).step_by(step_y) {
                     let c_l = img.data[by * w].map(|v| v * gain);
@@ -658,20 +682,32 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
                 for (i, v) in out.data.iter_mut().enumerate() {
                     let (x, y) = (i % w, i / w);
                     let n = m.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
-                    let d = (((n.x - 0.5) / 0.36).powi(2) + ((n.y - 0.54) / 0.42).powi(2)).sqrt() as f32;
-                    let contrast = (log_l.data[i] - blur.data[i]).abs();
+                    let d = (((n.x - 0.5) / 0.37).powi(2) + ((n.y - 0.53) / 0.43).powi(2)).sqrt() as f32;
+                    let contrast_coarse = (log_l.data[i] - blur_coarse.data[i]).abs();
+                    let contrast_fine = (log_l.data[i] - blur_fine.data[i]).abs();
                     let lab = lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(img.data[i].map(|c| c * gain)));
-                    let d_bg = border_labs
-                        .iter()
-                        .map(|b| ((lab[1] - b[1]).powi(2) + (lab[2] - b[2]).powi(2) + 0.25 * (lab[0] - b[0]).powi(2)).sqrt())
-                        .fold(f32::MAX, f32::min);
-                    let bg_diff = smooth(0.02, 0.08, d_bg);
-                    *v = (1.0 - smooth(0.62, 1.04, d)) * (0.35 + 0.65 * bg_diff.max(smooth(0.05, 0.55, contrast)));
+                    // 2nd-nearest border sample distance so isolated border outliers do not swallow the subject
+                    let mut d1 = f32::MAX;
+                    let mut d2 = f32::MAX;
+                    for b in &border_labs {
+                        let dist = ((lab[1] - b[1]).powi(2) + (lab[2] - b[2]).powi(2) + 0.30 * (lab[0] - b[0]).powi(2)).sqrt();
+                        if dist < d1 {
+                            d2 = d1;
+                            d1 = dist;
+                        } else if dist < d2 {
+                            d2 = dist;
+                        }
+                    }
+                    let d_bg = if d2 < f32::MAX { d2 } else { d1 };
+                    let bg_diff = smooth(0.018, 0.082, d_bg);
+                    let detail_cue = smooth(0.04, 0.50, contrast_coarse + 0.8 * contrast_fine);
+                    let center_prior = 1.0 - smooth(0.58, 1.06, d);
+                    *v = center_prior * (0.30 + 0.70 * bg_diff.max(detail_cue));
                 }
-                let sigma = (0.010 * frame_px(frame, w)).clamp(2.0, 14.0);
-                out = guided_cross(log_l, &out, sigma, 0.004);
+                let sigma = (0.0085 * frame_px(frame, w)).clamp(2.0, 12.0);
+                out = guided_cross(log_l, &out, sigma, 0.0028);
                 for v in &mut out.data {
-                    *v = smooth(0.22, 0.78, *v);
+                    *v = smooth(0.24, 0.76, *v);
                 }
             }
         }
@@ -680,7 +716,60 @@ pub fn shape_alpha(shape: &MaskShape, frame: &Frame, w: usize, h: usize, img: &R
             s.data.iter_mut().for_each(|v| *v = 1.0 - *v);
             out = s;
         }
-        MaskShape::DepthRange { .. } | MaskShape::Landscape { .. } => {}
+        MaskShape::Landscape { class } => {
+            let cls = class.trim().to_ascii_lowercase();
+            if cls.contains("sky") || cls.contains("cielo") {
+                out = shape_alpha(&MaskShape::Sky, frame, w, h, img, log_l, ev, mattes);
+            } else {
+                let m = frame.out_to_norm(w, h);
+                let blur_fine = lightcraft_raster::blur::gaussian(log_l, (0.006 * frame_px(frame, w)).max(1.0));
+                let is_veg = cls.contains("veg")
+                    || cls.contains("tree")
+                    || cls.contains("foliage")
+                    || cls.contains("grass")
+                    || cls.contains("plant")
+                    || cls.contains("arbol")
+                    || cls.contains("árbol")
+                    || cls.contains("pasto")
+                    || cls.is_empty();
+                let is_water = cls.contains("water") || cls.contains("sea") || cls.contains("ocean") || cls.contains("lake") || cls.contains("agua") || cls.contains("mar");
+                let is_mountain = cls.contains("mountain") || cls.contains("hill") || cls.contains("rock") || cls.contains("montaña");
+                for (i, v) in out.data.iter_mut().enumerate() {
+                    let (x, y) = (i % w, i / w);
+                    let n = m.apply(Point::new(x as f64 + 0.5, y as f64 + 0.5));
+                    let c = img.data[i].map(|v| v * gain);
+                    let lab = lightcraft_color::perceptual::oklab_from_2020(tonemap_for_select(c));
+                    let detail = (log_l.data[i] - blur_fine.data[i]).abs();
+                    *v = if is_veg {
+                        // Green, olive, and golden-green foliage/grass in OkLab + leaf micro-texture
+                        let green_a = smooth(-0.004, -0.042, lab[1]);
+                        let yellow_b = smooth(0.012, 0.055, lab[2]);
+                        let tex = 0.65 + 0.35 * smooth(0.02, 0.25, detail);
+                        (green_a * yellow_b * tex).clamp(0.0, 1.0)
+                    } else if is_water {
+                        // Lower-half cyan/blue/teal reflective water surfaces
+                        let blue_teal = smooth(0.005, 0.045, -lab[2]) * smooth(-0.04, 0.02, -lab[1]);
+                        let lower = smooth(0.28, 0.58, n.y as f32);
+                        (blue_teal * lower).clamp(0.0, 1.0)
+                    } else if is_mountain {
+                        // Mid-frame horizon band with rocky/mineral neutral-cool tones
+                        let band = smooth(0.15, 0.35, n.y as f32) * (1.0 - smooth(0.65, 0.88, n.y as f32));
+                        let chroma = (lab[1].hypot(lab[2])).clamp(0.0, 1.0);
+                        let mineral = 1.0 - smooth(0.06, 0.14, chroma);
+                        (band * mineral).clamp(0.0, 1.0)
+                    } else {
+                        // Architecture / ground / urban surfaces: low-to-moderate chroma + structural edges
+                        let chroma = (lab[1].hypot(lab[2])).clamp(0.0, 1.0);
+                        let neutral_warm = 1.0 - smooth(0.05, 0.13, chroma);
+                        let non_top = smooth(0.18, 0.45, n.y as f32);
+                        (neutral_warm * non_top).clamp(0.0, 1.0)
+                    };
+                }
+                let sigma = (0.008 * frame_px(frame, w)).clamp(1.5, 10.0);
+                out = guided_cross(log_l, &out, sigma, 0.0025);
+            }
+        }
+        MaskShape::DepthRange { .. } => {}
     }
     if let Some(key) = cache_key
         && let Ok(mut guard) = SHAPE_ALPHA_CACHE.lock()

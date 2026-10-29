@@ -73,6 +73,11 @@ const FIELDS: &[(&str, usize)] = &[
     ("OUT_Y", 3),
     ("OUT_TRC", 1),
     ("OUT_GAMMA", 1),
+    ("OVL", 1),
+    ("OVL_OFF", 1),
+    ("OVL_BLEND", 1),
+    ("OVL_FLIP", 1),
+    ("OVL_PARAMS", 7),
     // first row of a band dispatch (the kernel runs over rows Y0.., see `render`)
     ("Y0", 1),
 ];
@@ -156,8 +161,31 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     for m in masks {
         aux.extend_from_slice(m);
     }
+    let ovl_off = aux.len();
+    if let Some(ovl) = &fp.overlay {
+        aux.extend_from_slice(&ovl.map);
+    }
 
     let mut p = Block::new();
+    p.fs("VIG_VIEW", &fp.view);
+    if let Some(ovl) = &fp.overlay {
+        p.b("OVL", true);
+        p.u("OVL_OFF", ovl_off as u32);
+        p.u("OVL_BLEND", ovl.blend);
+        p.u("OVL_FLIP", (ovl.flip_x as u32) | ((ovl.flip_y as u32) << 1));
+        p.fs(
+            "OVL_PARAMS",
+            &[
+                ovl.amount,
+                ovl.cos_a,
+                ovl.sin_a,
+                ovl.inv_scale,
+                ovl.shift_x,
+                ovl.shift_y,
+                ovl.protect_center,
+            ],
+        );
+    }
     p.u("W", fp.w as u32);
     p.u("H", fp.h as u32);
     p.u("NMASK", masks.len() as u32);

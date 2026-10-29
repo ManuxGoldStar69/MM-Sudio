@@ -36,6 +36,7 @@ pub mod lut;
 pub mod masks;
 pub mod optics;
 pub mod output;
+pub mod overlays;
 pub mod profiles;
 pub mod redeye;
 pub mod spots;
@@ -443,6 +444,15 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         geo,
         [wb_t, wb_tint, info.as_shot_temp, info.as_shot_tint].map(f64::to_bits),
         format!("{:?}", s.spots),
+        [
+            s.overlay.expand_all,
+            s.overlay.expand_top,
+            s.overlay.expand_bottom,
+            s.overlay.expand_left,
+            s.overlay.expand_right,
+            s.overlay.fill_borders,
+        ]
+        .map(f64::to_bits),
         format!("{eyes:?}"),
         // defringe runs in this stage
         format!("{:?}", s.optics),
@@ -462,7 +472,7 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
 pub fn lin_needs_cpu(s: &DevelopSettings, info: &SourceInfo) -> bool {
     let o = &s.optics;
     let defringe = s.section_enabled("optics") && (o.defringe_purple_amount > 0.0 || o.defringe_green_amount > 0.0);
-    defringe || !s.spots.is_empty() || local_tone::enabled(info, s)
+    defringe || !s.spots.is_empty() || s.overlay.has_outpaint() || local_tone::enabled(info, s)
 }
 
 /// The white-balanced, defringed, retouched image (before noise reduction): the CPU part of the
@@ -474,6 +484,7 @@ pub fn lin_cpu(img: &mut Rgb32f, info: &SourceInfo, p: &Plan<'_>) {
     local::white_balance(img, info, s);
     optics::defringe(img, s, p.px_per_long / optics::DEFRINGE_REF_LONG);
     spots::apply(img, &s.spots, &p.frame, p.px_per_long);
+    spots::apply_outpaint(img, &s.overlay);
     redeye::apply(img, &p.eyes);
 }
 

@@ -326,7 +326,8 @@ impl Solver<'_> {
                         }
                         let s = nnf[ti];
                         let (sx, sy) = (s.0 - dx, s.1 - dy);
-                        let wt = (-cost[ti] / (2.0 * sigma2)).exp().max(1e-8);
+                        let spat = 1.0 / (1.0 + 0.22 * (dx * dx + dy * dy) as f32);
+                        let wt = ((-cost[ti] / (1.5 * sigma2)).exp() * spat).max(1e-8);
                         let si = (sy as usize * w + sx as usize) * ch;
                         for c in 0..ch {
                             acc[c] += img[si + c] * wt;

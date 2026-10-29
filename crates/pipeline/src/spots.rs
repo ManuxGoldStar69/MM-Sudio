@@ -10,8 +10,12 @@
 //!   structure is chosen at a scale set by the spot's size (the same at preview and export size).
 //!   Deterministic; the source offset is ignored.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
+
 use lightcraft_develop::{Spot, SpotMode};
 use lightcraft_geom::Point;
+use lightcraft_inpaint::LamaConfig;
 use lightcraft_raster::Rgb32f;
 
 use crate::geometry::Frame;
@@ -58,19 +62,24 @@ fn ring_stats(img: &Rgb32f, c: (f32, f32), r0: f32, r1: f32) -> Option<Vec<[f32;
 
 fn score(img: &Rgb32f, target: (f32, f32), source: (f32, f32), r: f32) -> f32 {
     let (Some(a), Some(b)) = (ring_stats(img, target, r * 1.05, r * 1.6), ring_stats(img, source, r * 1.05, r * 1.6)) else { return f32::MAX };
-    // also compare the inside of the source against the target's surroundings (texture continuity)
+    // Compare in perceptual Oklab (luminance + chrominance) plus interior texture roughness continuity
     let inside = ring_stats(img, source, r * 0.2, r * 0.9);
+    let to_lab = |rgb: &[f32; 3]| lightcraft_color::perceptual::oklab_from_2020(rgb.map(|v| v.max(0.0)));
     let mut s = 0.0;
     for (p, q) in a.iter().zip(&b) {
-        for c in 0..3 {
-            let (u, v) = (p[c].max(0.0).sqrt(), q[c].max(0.0).sqrt());
-            s += (u - v) * (u - v);
-        }
+        let lp = to_lab(p);
+        let lq = to_lab(q);
+        let dl = lp[0] - lq[0];
+        let da = lp[1] - lq[1];
+        let db = lp[2] - lq[2];
+        s += dl * dl + 2.5 * (da * da + db * db);
     }
     if let Some(ins) = inside {
-        let mean_a: f32 = a.iter().map(|p| p[1].max(0.0).sqrt()).sum::<f32>() / a.len() as f32;
-        let var: f32 = ins.iter().map(|p| (p[1].max(0.0).sqrt() - mean_a).powi(2)).sum::<f32>() / ins.len() as f32;
-        s += var * a.len() as f32 * 0.5;
+        let mean_l: f32 = a.iter().map(|p| to_lab(p)[0]).sum::<f32>() / a.len() as f32;
+        let var_ring: f32 = a.iter().map(|p| (to_lab(p)[0] - mean_l).powi(2)).sum::<f32>() / a.len() as f32;
+        let mean_ins: f32 = ins.iter().map(|p| to_lab(p)[0]).sum::<f32>() / ins.len() as f32;
+        let var_ins: f32 = ins.iter().map(|p| (to_lab(p)[0] - mean_ins).powi(2)).sum::<f32>() / ins.len() as f32;
+        s += ((var_ins - var_ring).abs() + var_ins * 0.35) * a.len() as f32;
     }
     s
 }
@@ -189,9 +198,17 @@ pub fn window_for_reads_checked(
             for p in &pts {
                 (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
             }
-            // the box `apply` works in: the stroke plus a radius, plus a radius of padding
-            let t = [x0 - 2.0 * r, y0 - 2.0 * r, x1 + 2.0 * r, y1 + 2.0 * r];
+            // the box `apply` works in: the stroke plus a radius, plus context padding (40% of bbox or 2r for AI Fill)
+            let (pad_x, pad_y) = if spot.mode == SpotMode::Fill {
+                let sw = (x1 - x0 + 2.0 * r).max(1.0);
+                let sh = (y1 - y0 + 2.0 * r).max(1.0);
+                ((sw * 0.40).max(2.0 * r) + r, (sh * 0.40).max(2.0 * r) + r)
+            } else {
+                (2.0 * r, 2.0 * r)
+            };
+            let t = [x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y];
             let s = match spot.source_offset {
+                _ if spot.mode == SpotMode::Fill => t,
                 Some(o) => {
                     let b = to_out.apply(o);
                     let (dx, dy) = (b.x - origin.x, b.y - origin.y);
@@ -256,9 +273,30 @@ pub fn window_for_reads_checked(
     )
 }
 
-/// Content-aware fill of the box: `src` becomes `tgt` with every pixel under the stroke (`alpha > 0.05`)
-/// rebuilt from the rest of the box. Falls back to a smooth membrane fill when the box holds no whole
-/// patch to copy from.
+static LAMA_PATCH_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<(u64, Vec<[f32; 3]>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn lama_cache_key(tgt: &[[f32; 3]], hole: &[bool], bw: usize, bh: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bw.hash(&mut h);
+    bh.hash(&mut h);
+    let step = (tgt.len() / 256).max(1);
+    for i in (0..tgt.len()).step_by(step) {
+        tgt[i][0].to_bits().hash(&mut h);
+        tgt[i][1].to_bits().hash(&mut h);
+        tgt[i][2].to_bits().hash(&mut h);
+    }
+    let hstep = (hole.len() / 512).max(1);
+    for i in (0..hole.len()).step_by(hstep) {
+        hole[i].hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Content-aware LaMa local inpainting of the 40%-context bounding box: `src` becomes `tgt` with
+/// every pixel under the binary stroke mask (`alpha > 0.05`) reconstructed via `inpaint_lama_box`
+/// (rescaled to 512×512 or 1024×1024 for speed, with ISO-matched grain synthesis and LRU caching).
 fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh: usize) {
     let hole: Vec<bool> = alpha.iter().map(|a| *a > 0.05).collect();
     if !hole.iter().any(|&h| h) {
@@ -267,25 +305,153 @@ fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh
         }
         return;
     }
+    let key = lama_cache_key(tgt, &hole, bw, bh);
+    if let Ok(guard) = LAMA_PATCH_CACHE.lock()
+        && let Some((_, cached)) = guard.iter().find(|(k, v)| *k == key && v.len() == src.len())
+    {
+        src.copy_from_slice(cached);
+        return;
+    }
     let flat: Vec<f32> = tgt.iter().flatten().copied().collect();
-    let params = if bw.max(bh) <= 512 {
-        lightcraft_inpaint::CompleteParams {
-            patch_radius: 4,
-            em_iters: 10,
-            min_em_iters: 3,
-            pm_iters: 3,
-            refine_extent: 112,
-            seed: 1,
-        }
-    } else {
-        lightcraft_inpaint::CompleteParams::default()
+    let max_side = 1024;
+    let cfg = lightcraft_inpaint::LamaConfig {
+        max_side,
+        seed: key ^ 0x4C41_4D42,
+        iso: 0,
     };
-    let out = lightcraft_inpaint::complete(bw, bh, 3, &flat, &hole, &params)
-        .unwrap_or_else(|| lightcraft_inpaint::membrane_fill(bw, bh, 3, &flat, &hole));
+    let out = lightcraft_inpaint::inpaint_lama_box(&flat, &hole, bw, bh, &cfg);
     let (pixels, _) = out.as_chunks::<3>();
     for (d, v) in src.iter_mut().zip(pixels) {
         *d = *v;
     }
+    if let Ok(mut guard) = LAMA_PATCH_CACHE.lock() {
+        if guard.len() >= 24 {
+            guard.remove(0);
+        }
+        guard.push((key, src.to_vec()));
+    }
+}
+
+/// Frequency-Separated (Laplacian Pyramid High-Pass + Low-Pass) + Statistical LAB Color Transfer
+/// healing in perceptual Oklab space:
+/// 1. Matches mean (mu_L, mu_a, mu_b) and standard deviation (sigma_L, sigma_a, sigma_b) in LAB
+///    between the target boundary ring and the source patch.
+/// 2. Extracts 2-band Laplacian high-frequency texture (fine + mid) from the color-corrected source.
+/// 3. Reconstructs the target zone's exact low-frequency illumination and shadow gradient via
+///    normalized boundary membrane convolution and recombines High(Source') + Low(Target).
+fn heal_frequency_separated_lab(src: &[[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh: usize, r: f32) -> Vec<[f32; 3]> {
+    let n = bw * bh;
+    let to_lab = |rgb: [f32; 3]| lightcraft_color::perceptual::oklab_from_2020(rgb.map(|c| c.max(0.0)));
+    let from_lab = |lab: [f32; 3]| lightcraft_color::perceptual::oklab_to_2020([lab[0].max(0.0), lab[1], lab[2]]).map(|c| c.max(0.0));
+
+    let src_lab: Vec<[f32; 3]> = src.iter().copied().map(to_lab).collect();
+    let tgt_lab: Vec<[f32; 3]> = tgt.iter().copied().map(to_lab).collect();
+
+    // 1. Statistical moments (mean & std) in LAB over the target boundary ring vs source patch
+    let mut sum_t = [0.0f32; 3];
+    let mut sum_s = [0.0f32; 3];
+    let mut wt_sum = 0.0f32;
+    for i in 0..n {
+        let a = alpha[i];
+        // Boundary ring weights: strongest right outside and along the outer edge of the stroke
+        let w_ring = if a < 0.35 { 1.0 - a * 2.5 } else { 0.0 }.max(0.0);
+        if w_ring > 0.0 {
+            for c in 0..3 {
+                sum_t[c] += tgt_lab[i][c] * w_ring;
+                sum_s[c] += src_lab[i][c] * w_ring;
+            }
+            wt_sum += w_ring;
+        }
+    }
+    let inv_w = if wt_sum > 1e-4 { 1.0 / wt_sum } else { 0.0 };
+    let mu_t = sum_t.map(|v| v * inv_w);
+    let mu_s = sum_s.map(|v| v * inv_w);
+
+    let mut var_t = [0.0f32; 3];
+    let mut var_s = [0.0f32; 3];
+    if wt_sum > 1e-4 {
+        for i in 0..n {
+            let a = alpha[i];
+            let w_ring = if a < 0.35 { 1.0 - a * 2.5 } else { 0.0 }.max(0.0);
+            if w_ring > 0.0 {
+                for c in 0..3 {
+                    var_t[c] += (tgt_lab[i][c] - mu_t[c]).powi(2) * w_ring;
+                    var_s[c] += (src_lab[i][c] - mu_s[c]).powi(2) * w_ring;
+                }
+            }
+        }
+    }
+    let std_t = var_t.map(|v| (v * inv_w).max(0.0).sqrt());
+    let std_s = var_s.map(|v| (v * inv_w).max(0.0).sqrt());
+    let gain_l = ((std_t[0] + 1e-3) / (std_s[0] + 1e-3)).clamp(0.60, 1.65);
+    let gain_a = ((std_t[1] + 5e-4) / (std_s[1] + 5e-4)).clamp(0.55, 1.55);
+    let gain_b = ((std_t[2] + 5e-4) / (std_s[2] + 5e-4)).clamp(0.55, 1.55);
+
+    // Statistically color-adapted source in LAB
+    let src_adapted = Rgb32f {
+        width: bw,
+        height: bh,
+        data: src_lab
+            .iter()
+            .map(|s| {
+                [
+                    (mu_t[0] + (s[0] - mu_s[0]) * gain_l).max(0.0),
+                    mu_t[1] + (s[1] - mu_s[1]) * gain_a,
+                    mu_t[2] + (s[2] - mu_s[2]) * gain_b,
+                ]
+            })
+            .collect(),
+    };
+
+    // 2. Laplacian Pyramid Frequency Separation (Fine + Mid High-Pass vs Coarse Low-Pass)
+    let sigma_fine = (r * 0.22).max(0.8);
+    let sigma_coarse = (r * 0.62).max(1.6);
+    let src_blur_fine = lightcraft_raster::blur::gaussian(&src_adapted, sigma_fine);
+    let src_blur_coarse = lightcraft_raster::blur::gaussian(&src_adapted, sigma_coarse);
+
+    // 3. Target Low-Pass illumination & shadow gradient via normalized exterior boundary membrane
+    // of (Target_LAB - LowPass(Source'_LAB))
+    let outside: Vec<f32> = alpha.iter().map(|a| if *a < 0.02 { 1.0 } else { 0.0 }).collect();
+    let diff_low = Rgb32f {
+        width: bw,
+        height: bh,
+        data: tgt_lab
+            .iter()
+            .zip(&src_blur_coarse.data)
+            .zip(&outside)
+            .map(|((t, s_low), m)| [(t[0] - s_low[0]) * m, (t[1] - s_low[1]) * m, (t[2] - s_low[2]) * m])
+            .collect(),
+    };
+    let wts = lightcraft_raster::Plane { width: bw, height: bh, data: outside };
+    let sigma_mem = (r * 0.65).max(1.2);
+    let (bd, bm) = (
+        lightcraft_raster::blur::gaussian(&diff_low, sigma_mem),
+        lightcraft_raster::blur::gaussian(&wts, sigma_mem),
+    );
+
+    // 4. Recombine: Target Low-Pass Illumination + Source Laplacian High-Pass (Fine + Mid bands)
+    let mut out_rgb = Vec::with_capacity(n);
+    for i in 0..n {
+        let s_full = src_adapted.data[i];
+        let s_mid = src_blur_fine.data[i];
+        let s_low = src_blur_coarse.data[i];
+        // Laplacian pyramid detail bands of the statistically color-matched source
+        let h_fine = [s_full[0] - s_mid[0], s_full[1] - s_mid[1], s_full[2] - s_mid[2]];
+        let h_mid = [s_mid[0] - s_low[0], s_mid[1] - s_low[1], s_mid[2] - s_low[2]];
+
+        // Target illumination & shadow gradient
+        let m = bm.data[i].max(1e-4);
+        let d_low = [bd.data[i][0] / m, bd.data[i][1] / m, bd.data[i][2] / m];
+        let t_low = [s_low[0] + d_low[0], s_low[1] + d_low[1], s_low[2] + d_low[2]];
+
+        let healed_lab = [
+            t_low[0] + h_fine[0] + h_mid[0],
+            t_low[1] + h_fine[1] + h_mid[1],
+            t_low[2] + h_fine[2] + h_mid[2],
+        ];
+        out_rgb.push(from_lab(healed_lab));
+    }
+    out_rgb
 }
 
 /// Apply all spots to `img` (output resolution). `ppl` = output pixels per long-edge unit.
@@ -296,6 +462,10 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
     let (w, h) = (img.width, img.height);
     let to_out = frame.norm_to_out(w, h);
     for spot in spots {
+        let opacity = (spot.opacity / 100.0).clamp(0.0, 1.0) as f32;
+        if opacity <= 0.0 {
+            continue;
+        }
         let r = radius_px(spot.size, ppl) as f32;
         let pts: Vec<(f32, f32)> = spot
             .points
@@ -316,7 +486,7 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             }
             None => auto_source(img, first, r),
         };
-        // Bounding box of the stroke.
+        // Tight bounding box of the stroke.
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for p in &pts {
             x0 = x0.min(p.0 - r);
@@ -324,16 +494,29 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             x1 = x1.max(p.0 + r);
             y1 = y1.max(p.1 + r);
         }
-        // content-aware fill reads the spot's surroundings (the window holds 2 radii around it)
-        let pad = if fill { 2.0 * r } else { r };
-        let (bx0, by0) = (((x0 - pad).floor().max(0.0)) as usize, ((y0 - pad).floor().max(0.0)) as usize);
-        let (bx1, by1) = (((x1 + pad).ceil() as usize).min(w), ((y1 + pad).ceil() as usize).min(h));
+        // In AI LaMa mode (`Fill`), crop with a 40% context margin around the stroke bbox (at least 2r)
+        let (pad_x, pad_y) = if fill {
+            let sw = (x1 - x0).max(1.0);
+            let sh = (y1 - y0).max(1.0);
+            ((sw * 0.40).max(2.0 * r), (sh * 0.40).max(2.0 * r))
+        } else {
+            (r, r)
+        };
+        let (bx0, by0) = (((x0 - pad_x).floor().max(0.0)) as usize, ((y0 - pad_y).floor().max(0.0)) as usize);
+        let (bx1, by1) = (((x1 + pad_x).ceil() as usize).min(w), ((y1 + pad_y).ceil() as usize).min(h));
         if bx1 <= bx0 || by1 <= by0 {
             continue;
         }
         let (bw, bh) = (bx1 - bx0, by1 - by0);
         let feather = (spot.feather / 100.0).clamp(0.0, 1.0) as f32;
-        let opacity = (spot.opacity / 100.0).clamp(0.0, 1.0) as f32;
+        // For AI Fill, when feather > 0, enforce a smooth 8px feather (scaled to output resolution)
+        let feather_band = if fill && feather > 0.0 {
+            let px_8 = (8.0 * (ppl as f32 / 1200.0)).max(1.5).min(r * 0.9);
+            (r * feather * 0.8).max(px_8)
+        } else {
+            r * feather * 0.8
+        };
+        let inner = (r - feather_band).max(0.0);
         // alpha of the stroke and source patch in the box
         let mut alpha = vec![0.0f32; bw * bh];
         let mut src = vec![[0.0f32; 3]; bw * bh];
@@ -342,7 +525,6 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             for x in 0..bw {
                 let (px, py) = ((bx0 + x) as f32 + 0.5, (by0 + y) as f32 + 0.5);
                 let d = pts.iter().map(|p| ((px - p.0).powi(2) + (py - p.1).powi(2)).sqrt()).fold(f32::MAX, f32::min);
-                let inner = r * (1.0 - feather * 0.8);
                 alpha[y * bw + x] = (1.0 - smooth(inner, r, d)) * opacity;
                 src[y * bw + x] = img.sample_bilinear(px + offset.0, py + offset.1);
                 tgt[y * bw + x] = img.get(bx0 + x, by0 + y);
@@ -352,31 +534,8 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             fill_box(&mut src, &tgt, &alpha, bw, bh);
         }
         let heal = matches!(spot.mode, SpotMode::Remove | SpotMode::Heal);
-        let low = if heal {
-            // Tone correction from the spot's *surroundings* only: normalized convolution of
-            // (target − source) over pixels outside the stroke (a membrane-like interpolation).
-            let outside: Vec<f32> = alpha.iter().map(|a| if *a < 0.02 { 1.0 } else { 0.0 }).collect();
-            let diff = Rgb32f {
-                width: bw,
-                height: bh,
-                data: tgt.iter().zip(&src).zip(&outside).map(|((t, s), m)| [(t[0] - s[0]) * m, (t[1] - s[1]) * m, (t[2] - s[2]) * m]).collect(),
-            };
-            let wts = lightcraft_raster::Plane { width: bw, height: bh, data: outside };
-            let sigma = (r * 0.6).max(1.0);
-            let (bd, bm) = (lightcraft_raster::blur::gaussian(&diff, sigma), lightcraft_raster::blur::gaussian(&wts, sigma));
-            Some(Rgb32f {
-                width: bw,
-                height: bh,
-                data: bd
-                    .data
-                    .iter()
-                    .zip(&bm.data)
-                    .map(|(d, m)| {
-                        let m = m.max(1e-4);
-                        [d[0] / m, d[1] / m, d[2] / m]
-                    })
-                    .collect(),
-            })
+        let healed = if heal {
+            Some(heal_frequency_separated_lab(&src, &tgt, &alpha, bw, bh, r))
         } else {
             None
         };
@@ -387,14 +546,137 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
                 if a <= 0.0 {
                     continue;
                 }
-                let mut v = src[i];
-                if let Some(l) = &low {
-                    let d = l.data[i];
-                    v = [v[0] + d[0], v[1] + d[1], v[2] + d[2]];
-                }
+                let v = match &healed {
+                    Some(h_buf) => h_buf[i],
+                    None => src[i],
+                };
                 let t = tgt[i];
                 img.set(bx0 + x, by0 + y, [t[0] + (v[0] - t[0]) * a, t[1] + (v[1] - t[1]) * a, t[2] + (v[2] - t[2]) * a].map(|c| c.max(0.0)));
             }
+        }
+    }
+}
+
+static OUTPAINT_CACHE: OnceLock<Mutex<Vec<(u64, usize, usize, Vec<[f32; 3]>)>>> = OnceLock::new();
+
+/// Applies generative AI border expansion (Outpainting via LaMa ONNX + multi-scale texture synthesis)
+/// and/or automatic corner filling for rotated/straightened frames.
+pub fn apply_outpaint(img: &mut Rgb32f, ovl: &lightcraft_develop::CreativeOverlay) {
+    if !ovl.has_outpaint() || img.width < 16 || img.height < 16 {
+        return;
+    }
+    let w = img.width;
+    let h = img.height;
+
+    let top_pct = (ovl.expand_all + ovl.expand_top).clamp(0.0, 40.0) / 100.0;
+    let bot_pct = (ovl.expand_all + ovl.expand_bottom).clamp(0.0, 40.0) / 100.0;
+    let left_pct = (ovl.expand_all + ovl.expand_left).clamp(0.0, 40.0) / 100.0;
+    let right_pct = (ovl.expand_all + ovl.expand_right).clamp(0.0, 40.0) / 100.0;
+    let fill_corners = ovl.fill_borders >= 0.5;
+
+    // Hash parameters + sparse image content fingerprint
+    let mut h_state = DefaultHasher::new();
+    w.hash(&mut h_state);
+    h.hash(&mut h_state);
+    top_pct.to_bits().hash(&mut h_state);
+    bot_pct.to_bits().hash(&mut h_state);
+    left_pct.to_bits().hash(&mut h_state);
+    right_pct.to_bits().hash(&mut h_state);
+    fill_corners.hash(&mut h_state);
+    let step = (img.data.len() / 96).max(1);
+    for px in img.data.iter().step_by(step) {
+        ((px[0] * 1024.0) as i32).hash(&mut h_state);
+        ((px[1] * 1024.0) as i32).hash(&mut h_state);
+        ((px[2] * 1024.0) as i32).hash(&mut h_state);
+    }
+    let cache_key = h_state.finish();
+
+    let cache = OUTPAINT_CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(6)));
+    if let Ok(guard) = cache.lock()
+        && let Some((_, _, _, cached)) = guard.iter().find(|(k, cw, ch, _)| *k == cache_key && *cw == w && *ch == h)
+        && cached.len() == w * h
+    {
+        img.data.copy_from_slice(cached);
+        return;
+    }
+
+    let x0 = ((w as f64 * (left_pct / (1.0 + left_pct + right_pct))).round() as usize).min(w / 3);
+    let pad_r = ((w as f64 * (right_pct / (1.0 + left_pct + right_pct))).round() as usize).min(w / 3);
+    let x1 = w.saturating_sub(pad_r).max(x0 + 8).min(w);
+
+    let y0 = ((h as f64 * (top_pct / (1.0 + top_pct + bot_pct))).round() as usize).min(h / 3);
+    let pad_b = ((h as f64 * (bot_pct / (1.0 + top_pct + bot_pct))).round() as usize).min(h / 3);
+    let y1 = h.saturating_sub(pad_b).max(y0 + 8).min(h);
+
+    let iw = (x1 - x0).max(1);
+    let ih = (y1 - y0).max(1);
+
+    let mut canvas = vec![0.0f32; w * h * 3];
+    let mut border_hole = vec![false; w * h];
+
+    let has_margin = x0 > 0 || x1 < w || y0 > 0 || y1 < h;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if has_margin {
+                if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                    let sx = ((x - x0) as f32 + 0.5) * (w as f32 / iw as f32) - 0.5;
+                    let sy = ((y - y0) as f32 + 0.5) * (h as f32 / ih as f32) - 0.5;
+                    let p = img.sample_bilinear(sx, sy);
+                    let pl = img.sample_bilinear(sx - 0.75, sy);
+                    let pr = img.sample_bilinear(sx + 0.75, sy);
+                    let pu = img.sample_bilinear(sx, sy - 0.75);
+                    let pd = img.sample_bilinear(sx, sy + 0.75);
+                    for c in 0..3 {
+                        let lap = p[c] - 0.25 * (pl[c] + pr[c] + pu[c] + pd[c]);
+                        canvas[i * 3 + c] = (p[c] + 0.22 * lap).max(0.0);
+                    }
+                } else {
+                    border_hole[i] = true;
+                }
+            } else {
+                let p = img.get(x, y);
+                canvas[i * 3] = p[0];
+                canvas[i * 3 + 1] = p[1];
+                canvas[i * 3 + 2] = p[2];
+            }
+
+            if fill_corners && !border_hole[i] {
+                // Detect neutral BLANK canvas pixels near outer borders from rotation/perspective warps
+                let near_edge = x < w / 5 || x >= w - w / 5 || y < h / 5 || y >= h - h / 5;
+                if near_edge {
+                    let r = canvas[i * 3];
+                    let g = canvas[i * 3 + 1];
+                    let b = canvas[i * 3 + 2];
+                    if (r - g).abs() < 1e-4 && (g - b).abs() < 1e-4 && (r - 0.55).abs() < 0.15 {
+                        border_hole[i] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !border_hole.iter().any(|&b| b) {
+        return;
+    }
+
+    let cfg = LamaConfig {
+        max_side: 1024,
+        seed: cache_key ^ 0x4F55_5450_2027,
+        iso: 0,
+    };
+    let out_flat = lightcraft_inpaint::outpaint_lama_borders(&canvas, &border_hole, w, h, &cfg);
+    if out_flat.len() == w * h * 3 {
+        let mut out_px = Vec::with_capacity(w * h);
+        for chunk in out_flat.chunks_exact(3) {
+            out_px.push([chunk[0].max(0.0), chunk[1].max(0.0), chunk[2].max(0.0)]);
+        }
+        img.data.copy_from_slice(&out_px);
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() >= 6 {
+                guard.remove(0);
+            }
+            guard.push((cache_key, w, h, out_px));
         }
     }
 }

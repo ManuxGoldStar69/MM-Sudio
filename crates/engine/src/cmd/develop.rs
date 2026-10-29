@@ -173,7 +173,8 @@ pub fn specs() -> Vec<CommandSpec> {
             has_active,
             |s, p| {
                 let mut vals: Vec<(String, f64)> = Vec::new();
-                if let (Some(c), Some(v)) = (str_param(p, "control"), p.get("value").and_then(Value::as_f64)) {
+                let ctrl_key = str_param(p, "control").or_else(|| str_param(p, "id"));
+                if let (Some(c), Some(v)) = (ctrl_key, p.get("value").and_then(Value::as_f64)) {
                     vals.push((c.to_string(), v));
                 }
                 if let Some(o) = p.get("values").and_then(Value::as_object) {

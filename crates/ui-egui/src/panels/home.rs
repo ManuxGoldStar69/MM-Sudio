@@ -535,8 +535,8 @@ pub fn draw_welcome_modal(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // Backdrop veil
     ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(158));
 
-    let modal_w = 510.0f32.min(screen.width() - 32.0);
-    let modal_h = 415.0f32.min(screen.height() - 32.0);
+    let modal_w = 550.0f32.min(screen.width() - 28.0);
+    let modal_h = 566.0f32.min(screen.height() - 24.0);
     let card = Rect::from_center_size(screen.center(), vec2(modal_w, modal_h));
 
     // Close if user presses Escape or clicks outside the card
@@ -600,17 +600,80 @@ que yo más priorizo: tiene mejoras en el rendimiento y una galería muy\n\
 amplia de LUTs creativos (en el área de Efectos) para disfrutar\n\
 y explotar al máximo la creatividad.";
     ui.painter().text(
-        pos2(card.center().x, logo_rect.bottom() + 62.0),
+        pos2(card.center().x, logo_rect.bottom() + 56.0),
         Align2::CENTER_TOP,
         body_text,
-        t.font(12.5),
+        t.font(12.0),
         Color32::from_rgb(212, 208, 200),
     );
 
+    // Announcement Box: New Features Implemented
+    let news_top = logo_rect.bottom() + 148.0;
+    let news_box = Rect::from_min_max(
+        pos2(card.left() + 26.0, news_top),
+        pos2(card.right() - 26.0, card.bottom() - 172.0),
+    );
+    if news_box.height() > 60.0 {
+        ui.painter().rect(
+            news_box,
+            CornerRadius::same(12),
+            Color32::from_rgba_unmultiplied(26, 33, 31, 228),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(98, 212, 168, 95)),
+            StrokeKind::Inside,
+        );
+
+        ui.painter().text(
+            pos2(news_box.left() + 14.0, news_box.top() + 10.0),
+            Align2::LEFT_TOP,
+            "✨ NOVEDADES Y MEJORAS IMPLEMENTADAS",
+            t.semibold(11.0),
+            Color32::from_rgb(118, 232, 186),
+        );
+
+        let items = [
+            (
+                "⚡ Rendimiento ultra-fluido:",
+                "Cambio instantáneo entre fotos, caché inteligente y edición a 60 FPS.",
+            ),
+            (
+                "🌟 Galería de 180 Overlays HD:",
+                "6 categorías en Efectos (Bokeh, Fugas, Destellos, Lluvia, Polvo y Atmósfera).",
+            ),
+            (
+                "🪄 Borrado de Objetos y Máscaras IA:",
+                "Eliminación con IA (LaMa), Curado por Separación de Frecuencias LAB y rostros/objetos.",
+            ),
+            (
+                "⤢ Expansión de Imagen con IA:",
+                "Generación expansiva para ampliar bordes (+10% a +30%) con detalle nativo 1:1.",
+            ),
+        ];
+
+        let mut row_y = news_box.top() + 31.0;
+        let row_step = ((news_box.height() - 36.0) / 4.0).clamp(22.0, 29.0);
+        for (title_b, desc_b) in items {
+            ui.painter().text(
+                pos2(news_box.left() + 14.0, row_y),
+                Align2::LEFT_TOP,
+                title_b,
+                t.semibold(11.0),
+                Color32::from_rgb(246, 242, 232),
+            );
+            ui.painter().text(
+                pos2(news_box.left() + 26.0, row_y + 13.0),
+                Align2::LEFT_TOP,
+                desc_b,
+                t.font(10.3),
+                Color32::from_rgb(198, 204, 200),
+            );
+            row_y += row_step;
+        }
+    }
+
     // Optional Donation Box
     let don_box = Rect::from_min_max(
-        pos2(card.left() + 26.0, card.bottom() - 166.0),
-        pos2(card.right() - 26.0, card.bottom() - 68.0),
+        pos2(card.left() + 26.0, card.bottom() - 160.0),
+        pos2(card.right() - 26.0, card.bottom() - 64.0),
     );
     ui.painter().rect(
         don_box,

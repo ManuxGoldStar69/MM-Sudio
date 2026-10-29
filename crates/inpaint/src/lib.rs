@@ -18,9 +18,11 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod lama;
 pub mod membrane;
 pub mod patchmatch;
 
+pub use lama::{LamaConfig, inpaint_lama_box, local_onnx_model_path, outpaint_lama_borders, run_lama_onnx_512};
 pub use membrane::membrane_fill;
 pub use patchmatch::{CompleteParams, complete, complete_with};
 

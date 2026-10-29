@@ -320,14 +320,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 show_left_sidebar(app, &mut lui);
             }
 
-            // 2. Center Photo Stage Container (Top Sub-bar + Rounded Photo + Control Sub-bar + Horizontal Filmstrip)
-            {
-                let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::Min)));
-                cui.set_clip_rect(center_rect.expand(4.0));
-                show_center_stage(app, &mut cui, center_rect, screen_anim, photo_anim);
-            }
-
-            // 3. Optional Presets & LUTs Drawer
+            // 2. Optional Presets & LUTs Drawer (evaluated before center stage so hover_preview & clicks apply immediately)
             if app.ui.presets {
                 let presets_rect = Rect::from_min_max(pos2(presets_left, full.top() + 2.0), pos2(right_left - gap, main_bottom));
                 paint_glass_card(ui.painter(), presets_rect, 16, 198);
@@ -337,13 +330,20 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 super::presets::show(app, &mut pui);
             }
 
-            // 4. Right Studio Column (Histograma + 6-Tool Bar + [Luz + Curva de tonos] + Vertical Action Rail)
+            // 3. Right Studio Column (Histograma + 6-Tool Bar + [Luz + Curva de tonos] + Vertical Action Rail)
             if app.ui.right != RightPanel::None {
                 let right_rect = Rect::from_min_max(pos2(right_left, full.top() + 2.0), pos2(stage_right_edge, main_bottom));
                 register(ui.ctx(), "panel:right_panel", right_rect);
                 let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(right_rect).layout(egui::Layout::top_down(egui::Align::Min)));
                 rui.set_clip_rect(right_rect.expand(4.0));
                 show_right_panel(app, &mut rui);
+            }
+
+            // 4. Center Photo Stage Container (Top Sub-bar + Rounded Photo + Control Sub-bar + Horizontal Filmstrip)
+            {
+                let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(center_rect).layout(egui::Layout::top_down(egui::Align::Min)));
+                cui.set_clip_rect(center_rect.expand(4.0));
+                show_center_stage(app, &mut cui, center_rect, screen_anim, photo_anim);
             }
 
             // 5. Bottom Inspector & Export Bar
@@ -2119,6 +2119,8 @@ fn show_right_panel(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     show_object_eraser_card(app, ui, &t, &d);
                     ui.add_space(gap);
                     show_special_filters_card(app, ui, &t, &d);
+                    ui.add_space(gap);
+                    show_overlays_card(app, ui, &t, &d);
                     ui.add_space(gap);
                     show_ai_agent_card(app, ui, &t, &d);
                     ui.add_space(gap);
@@ -5544,6 +5546,884 @@ fn show_special_filters_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tok
 }
 
 // =============================================================================
+// CREATIVE OVERLAYS SUB-AREA (150 HIGH-RES OVERLAYS: 5 TYPES × 30 PER TYPE)
+// =============================================================================
+const OVERLAY_UI_CATEGORIES: &[(&str, &str)] = &[
+    ("all", "✨ Todos"),
+    ("leaks", "🔥 Fugas Luz"),
+    ("bokeh", "✨ Bokeh"),
+    ("sunbeams", "☀️ Rayos Sol"),
+    ("prism", "💎 Prisma"),
+    ("cinema", "🎬 Cine/Clima"),
+];
+
+fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d: &DevelopSettings) {
+    let catalog = lightcraft_pipeline::overlays::catalog();
+    let card_folded = app.ui.section_folded("studio:overlays");
+
+    let cat_id = egui::Id::new("studio-ovl-cat");
+    let search_open_id = egui::Id::new("studio-ovl-search-open");
+    let search_q_id = egui::Id::new("studio-ovl-search-q");
+    let fav_only_id = egui::Id::new("studio-ovl-fav-only");
+    let list_mode_id = egui::Id::new("studio-ovl-list-mode");
+    let page_offset_id = egui::Id::new("studio-ovl-page-offset");
+    let drag_ovl_id = egui::Id::new("studio-overlay-drag-active");
+
+    let cur_cat: usize = ui
+        .ctx()
+        .data(|dd| dd.get_temp::<usize>(cat_id))
+        .unwrap_or(0)
+        .min(OVERLAY_UI_CATEGORIES.len() - 1);
+    let mut search_open: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(search_open_id)).unwrap_or(false);
+    let mut search_q: String = ui.ctx().data(|dd| dd.get_temp::<String>(search_q_id)).unwrap_or_default();
+    let mut fav_only: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(fav_only_id)).unwrap_or(false);
+    let mut list_mode: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(list_mode_id)).unwrap_or(false);
+    let mut page_offset: usize = ui.ctx().data(|dd| dd.get_temp::<usize>(page_offset_id)).unwrap_or(0);
+    let mut drag_on: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(drag_ovl_id)).unwrap_or(false);
+
+    let active_idx = d.overlay.preset.round() as u16;
+    let active_spec = if (1..=150).contains(&active_idx) {
+        catalog.get((active_idx - 1) as usize)
+    } else {
+        None
+    };
+
+    let fav_count = catalog
+        .iter()
+        .filter(|e| app.session.profile_favorites.contains(&e.id))
+        .count();
+    if fav_only && fav_count == 0 {
+        fav_only = false;
+        ui.ctx().data_mut(|dd| dd.insert_temp(fav_only_id, false));
+    }
+
+    let w = ui.available_width();
+    let pad = 10.0;
+    let inner_w = (w - pad * 2.0).max(120.0);
+
+    egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(36, 38, 44, 192))
+        .stroke(Stroke::new(
+            1.0,
+            if active_spec.is_some() {
+                Color32::from_rgb(245, 192, 98).gamma_multiply(0.68)
+            } else {
+                Color32::from_white_alpha(26)
+            },
+        ))
+        .corner_radius(CornerRadius::same(13))
+        .show(ui, |ui| {
+            ui.set_width(w);
+
+            // 1. Header Bar
+            let header_h = 36.0;
+            let (hdr_r, hdr_resp) = ui.allocate_exact_size(vec2(w, header_h), Sense::click());
+
+            let btn_list = Rect::from_min_size(pos2(hdr_r.right() - pad - 60.0, hdr_r.center().y - 11.0), vec2(60.0, 22.0));
+            let btn_fav = Rect::from_min_size(pos2(btn_list.left() - 5.0 - 44.0, hdr_r.center().y - 11.0), vec2(44.0, 22.0));
+            let btn_search = Rect::from_min_size(pos2(btn_fav.left() - 5.0 - 26.0, hdr_r.center().y - 11.0), vec2(26.0, 22.0));
+
+            let caret = if card_folded { "▸" } else { "▾" };
+            ui.painter().text(
+                pos2(hdr_r.left() + pad + 4.0, hdr_r.center().y),
+                Align2::LEFT_CENTER,
+                caret,
+                t.semibold(12.0),
+                t.text,
+            );
+            let icon_c = pos2(hdr_r.left() + pad + 21.0, hdr_r.center().y);
+            ui.painter().circle_filled(
+                icon_c,
+                5.5,
+                if active_spec.is_some() {
+                    Color32::from_rgb(245, 198, 112)
+                } else {
+                    Color32::from_rgb(168, 178, 198)
+                },
+            );
+            ui.painter().text(
+                pos2(hdr_r.left() + pad + 35.0, hdr_r.center().y),
+                Align2::LEFT_CENTER,
+                "Overlays",
+                t.semibold(13.0),
+                Color32::WHITE,
+            );
+
+            // Search button
+            let s_resp = ui
+                .interact(btn_search, egui::Id::new("studio-ovl-btn-search"), Sense::click())
+                .on_hover_text("Buscar Overlay por nombre o estilo");
+            ui.painter().rect(
+                btn_search,
+                CornerRadius::same(8),
+                if search_open || !search_q.is_empty() {
+                    Color32::from_rgb(245, 192, 98).gamma_multiply(0.34)
+                } else if s_resp.hovered() {
+                    Color32::from_white_alpha(28)
+                } else {
+                    Color32::from_white_alpha(15)
+                },
+                Stroke::new(
+                    1.0,
+                    if search_open || !search_q.is_empty() {
+                        Color32::from_rgb(245, 192, 98)
+                    } else {
+                        Color32::from_white_alpha(32)
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(btn_search.center(), Align2::CENTER_CENTER, "🔍", t.font(10.5), Color32::WHITE);
+            if s_resp.clicked() {
+                search_open = !search_open;
+                ui.ctx().data_mut(|dd| dd.insert_temp(search_open_id, search_open));
+                if card_folded {
+                    app.ui.toggle_folded("studio:overlays");
+                }
+            }
+
+            // Favorites button
+            let f_resp = ui
+                .interact(btn_fav, egui::Id::new("studio-ovl-btn-fav"), Sense::click())
+                .on_hover_text("Mostrar solo tus Overlays favoritos (★)");
+            ui.painter().rect(
+                btn_fav,
+                CornerRadius::same(8),
+                if fav_only {
+                    Color32::from_rgb(245, 192, 98).gamma_multiply(0.34)
+                } else if f_resp.hovered() {
+                    Color32::from_white_alpha(28)
+                } else {
+                    Color32::from_white_alpha(15)
+                },
+                Stroke::new(
+                    1.0,
+                    if fav_only { Color32::from_rgb(245, 192, 98) } else { Color32::from_white_alpha(32) },
+                ),
+                StrokeKind::Inside,
+            );
+            let fav_label = if fav_count > 0 { format!("★ {fav_count}") } else { "★ Fav".to_string() };
+            ui.painter().text(
+                btn_fav.center(),
+                Align2::CENTER_CENTER,
+                fav_label,
+                t.semibold(9.8),
+                if fav_only { Color32::from_rgb(255, 225, 155) } else { Color32::from_rgb(220, 224, 234) },
+            );
+            if f_resp.clicked() && fav_count > 0 {
+                fav_only = !fav_only;
+                page_offset = 0;
+                ui.ctx().data_mut(|dd| {
+                    dd.insert_temp(fav_only_id, fav_only);
+                    dd.insert_temp(page_offset_id, page_offset);
+                });
+                if card_folded {
+                    app.ui.toggle_folded("studio:overlays");
+                }
+            }
+
+            // List vs Cards button
+            let l_resp = ui
+                .interact(btn_list, egui::Id::new("studio-ovl-btn-list"), Sense::click())
+                .on_hover_text(if list_mode {
+                    "Volver al carrusel deslizable de tarjetas visuales"
+                } else {
+                    "Ver lista compacta de los 150 Overlays"
+                });
+            ui.painter().rect(
+                btn_list,
+                CornerRadius::same(8),
+                if list_mode {
+                    Color32::from_rgb(245, 192, 98).gamma_multiply(0.34)
+                } else if l_resp.hovered() {
+                    Color32::from_white_alpha(28)
+                } else {
+                    Color32::from_white_alpha(15)
+                },
+                Stroke::new(
+                    1.0,
+                    if list_mode { Color32::from_rgb(245, 192, 98) } else { Color32::from_white_alpha(32) },
+                ),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                btn_list.center(),
+                Align2::CENTER_CENTER,
+                if list_mode { "🎴 Tarjetas" } else { "☰ Lista" },
+                t.semibold(9.8),
+                if list_mode { Color32::from_rgb(255, 225, 155) } else { Color32::from_rgb(220, 224, 234) },
+            );
+            if l_resp.clicked() {
+                list_mode = !list_mode;
+                ui.ctx().data_mut(|dd| dd.insert_temp(list_mode_id, list_mode));
+                if card_folded {
+                    app.ui.toggle_folded("studio:overlays");
+                }
+            } else if hdr_resp.clicked() {
+                app.ui.toggle_folded("studio:overlays");
+            }
+
+            if card_folded {
+                return;
+            }
+
+            // 2. Optional Search Bar
+            if search_open {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: pad as i8, right: pad as i8, top: 2, bottom: 4 })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let te = egui::TextEdit::singleline(&mut search_q)
+                                .hint_text("🔍 Buscar Kodak, Bokeh, Rayos, Prisma, Anamórfico, Nieve…")
+                                .desired_width(inner_w - 28.0);
+                            let resp = ui.add(te);
+                            if resp.changed() {
+                                page_offset = 0;
+                                ui.ctx().data_mut(|dd| {
+                                    dd.insert_temp(search_q_id, search_q.clone());
+                                    dd.insert_temp(page_offset_id, page_offset);
+                                });
+                            }
+                            if ui.small_button("✕").on_hover_text("Limpiar búsqueda").clicked() {
+                                search_q.clear();
+                                page_offset = 0;
+                                ui.ctx().data_mut(|dd| {
+                                    dd.insert_temp(search_q_id, search_q.clone());
+                                    dd.insert_temp(page_offset_id, page_offset);
+                                });
+                            }
+                        });
+                    });
+            }
+
+            // 3. 2-Row Category Filter Pills (3 pills per row = 6 pills: Todos + 5 categories of 30 overlays)
+            let cat_gap = 4.0;
+            let cat_row_h = 24.0;
+            let (cat_area, _) = ui.allocate_exact_size(vec2(w, cat_row_h * 2.0 + cat_gap + 4.0), Sense::hover());
+            let w3 = (inner_w - cat_gap * 2.0) / 3.0;
+            for (idx, (cid, clabel)) in OVERLAY_UI_CATEGORIES.iter().enumerate() {
+                let row = idx / 3;
+                let col = idx % 3;
+                let x = cat_area.left() + pad + col as f32 * (w3 + cat_gap);
+                let y = cat_area.top() + 1.0 + row as f32 * (cat_row_h + cat_gap);
+                let pill_r = Rect::from_min_size(pos2(x, y), vec2(w3, cat_row_h));
+                let resp = ui
+                    .interact(pill_r, egui::Id::new(("ovl-cat-pill", *cid)), Sense::click())
+                    .on_hover_text(match *cid {
+                        "all" => "150 Overlays ópticos en alta resolución (30 por categoría)",
+                        "leaks" => "30 Fugas de Luz analógicas (Kodak, Portra, Super 8, Sunset)",
+                        "bokeh" => "30 Overlays de Bokeh Dorado, Esferas 85mm f/1.2 y Partículas",
+                        "sunbeams" => "30 Overlays de Rayos de Sol Volumétricos y Atmósfera",
+                        "prism" => "30 Overlays de Prisma de Cristal, Cáusticas y Halación Cinestill",
+                        _ => "30 Overlays de Destellos Anamórficos, Estrellas y Clima (Lluvia/Nieve)",
+                    });
+                let active = cur_cat == idx;
+                ui.painter().rect(
+                    pill_r,
+                    CornerRadius::same(7),
+                    if active {
+                        Color32::from_rgb(245, 198, 112)
+                    } else if resp.hovered() {
+                        Color32::from_white_alpha(28)
+                    } else {
+                        Color32::from_white_alpha(13)
+                    },
+                    Stroke::new(
+                        1.0,
+                        if active { Color32::from_rgb(255, 228, 168) } else { Color32::from_white_alpha(26) },
+                    ),
+                    StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    pill_r.center(),
+                    Align2::CENTER_CENTER,
+                    *clabel,
+                    if active { t.semibold(9.9) } else { t.font(9.8) },
+                    if active { Color32::from_rgb(22, 22, 26) } else { Color32::from_rgb(222, 226, 235) },
+                );
+                if resp.clicked() {
+                    ui.ctx().data_mut(|dd| {
+                        dd.insert_temp(cat_id, idx);
+                        dd.insert_temp(page_offset_id, 0usize);
+                    });
+                }
+            }
+
+            let q_norm = search_q.trim().to_ascii_lowercase();
+            let sel_cat_id = OVERLAY_UI_CATEGORIES[cur_cat].0;
+            let filtered: Vec<&lightcraft_pipeline::overlays::OverlaySpec> = catalog
+                .iter()
+                .filter(|e| {
+                    if cur_cat != 0 && e.category.id() != sel_cat_id {
+                        return false;
+                    }
+                    if fav_only && !app.session.profile_favorites.contains(&e.id) {
+                        return false;
+                    }
+                    if !q_norm.is_empty() {
+                        let m_name = e.name.to_ascii_lowercase().contains(&q_norm);
+                        let m_sub = e.subtitle.to_ascii_lowercase().contains(&q_norm);
+                        let m_cat = e.category.label().to_ascii_lowercase().contains(&q_norm);
+                        if !m_name && !m_sub && !m_cat {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            if filtered.is_empty() {
+                let (empty_r, _) = ui.allocate_exact_size(vec2(w, 42.0), Sense::hover());
+                ui.painter().text(
+                    empty_r.center(),
+                    Align2::CENTER_CENTER,
+                    "No se encontraron Overlays con ese filtro.",
+                    t.font(10.5),
+                    Color32::from_rgb(185, 190, 202),
+                );
+                return;
+            }
+
+            // 4A. Visual Horizontal Scrollable Card Carousel (same style as Special Filters)
+            if !list_mode {
+                let total = filtered.len();
+                let (nav_r, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
+                let prev_r = Rect::from_min_size(pos2(nav_r.left() + pad, nav_r.top() + 1.0), vec2(26.0, 20.0));
+                let next_r = Rect::from_min_size(pos2(nav_r.right() - pad - 26.0, nav_r.top() + 1.0), vec2(26.0, 20.0));
+                let prev_resp = ui
+                    .interact(prev_r, egui::Id::new("ovl-carousel-prev"), Sense::click())
+                    .on_hover_text("Deslizar Overlays a la izquierda");
+                let next_resp = ui
+                    .interact(next_r, egui::Id::new("ovl-carousel-next"), Sense::click())
+                    .on_hover_text("Deslizar Overlays a la derecha");
+
+                for (btn_r, resp, sym) in [(prev_r, &prev_resp, "‹"), (next_r, &next_resp, "›")] {
+                    ui.painter().rect(
+                        btn_r,
+                        CornerRadius::same(6),
+                        if resp.hovered() { Color32::from_white_alpha(30) } else { Color32::from_white_alpha(14) },
+                        Stroke::new(1.0, Color32::from_white_alpha(28)),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        btn_r.center(),
+                        Align2::CENTER_CENTER,
+                        sym,
+                        t.semibold(13.0),
+                        Color32::WHITE,
+                    );
+                }
+
+                let cat_title = OVERLAY_UI_CATEGORIES[cur_cat].1;
+                ui.painter().text(
+                    nav_r.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{cat_title} · {total} Overlays HD (desliza ⇄)"),
+                    t.font(9.8),
+                    Color32::from_rgb(196, 202, 214),
+                );
+
+                let card_gap = 6.0;
+                let card_w = ((inner_w - card_gap * 2.0) / 3.15).clamp(78.0, 108.0);
+                let card_h = 84.0;
+                let step_px = (card_w + card_gap) * 3.0;
+                let mut scroll_delta_x = 0.0f32;
+                if prev_resp.clicked() {
+                    scroll_delta_x = -step_px;
+                }
+                if next_resp.clicked() {
+                    scroll_delta_x = step_px;
+                }
+
+                let mut clicked_ovl: Option<u16> = None;
+                let mut toggled_fav: Option<String> = None;
+
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: pad as i8, right: pad as i8, top: 2, bottom: 4 })
+                    .show(ui, |ui| {
+                        let mut sa = egui::ScrollArea::horizontal()
+                            .id_salt(("studio-ovl-cards-hscroll", cur_cat, fav_only))
+                            .max_height(card_h + 10.0)
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
+
+                        if scroll_delta_x != 0.0 {
+                            let cur_off = ui.ctx().data(|dd| dd.get_temp::<f32>(page_offset_id)).unwrap_or(0.0);
+                            let max_off = ((total as f32) * (card_w + card_gap) - inner_w).max(0.0);
+                            let next_off = (cur_off + scroll_delta_x).clamp(0.0, max_off);
+                            ui.ctx().data_mut(|dd| dd.insert_temp(page_offset_id, next_off));
+                            sa = sa.horizontal_scroll_offset(next_off);
+                        }
+
+                        let out = sa.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = card_gap;
+                                for entry in &filtered {
+                                    let (card_r, card_resp) = ui.allocate_exact_size(vec2(card_w, card_h), Sense::click());
+                                    let is_active = active_idx == entry.index;
+                                    let is_fav = app.session.profile_favorites.contains(&entry.id);
+
+                                    let fav_r = Rect::from_min_size(pos2(card_r.right() - 20.0, card_r.top() + 3.0), vec2(17.0, 17.0));
+                                    let over_fav = card_resp.hover_pos().is_some_and(|p| fav_r.contains(p));
+
+                                    let ca = Color32::from_rgb(entry.color_a[0], entry.color_a[1], entry.color_a[2]);
+                                    let cb = Color32::from_rgb(entry.color_b[0], entry.color_b[1], entry.color_b[2]);
+                                    let acc = Color32::from_rgb(entry.accent[0], entry.accent[1], entry.accent[2]);
+
+                                    // Card background
+                                    ui.painter().rect_filled(
+                                        card_r,
+                                        CornerRadius::same(10),
+                                        Color32::from_rgb(20, 22, 28),
+                                    );
+
+                                    // Visual Preview Banner (top 48px) illustrating the optical overlay
+                                    let banner_r = Rect::from_min_size(card_r.min, vec2(card_w, 48.0));
+                                    ui.painter().rect_filled(
+                                        banner_r,
+                                        CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 },
+                                        Color32::from_rgb(16, 18, 24),
+                                    );
+
+                                    // Render category-accurate optical preview inside banner_r
+                                    match entry.category {
+                                        lightcraft_pipeline::overlays::OverlayCategory::LightLeaks => {
+                                            let w1 = Rect::from_min_size(banner_r.min, vec2(card_w * 0.48, banner_r.height()));
+                                            let w2 = Rect::from_min_size(pos2(banner_r.left() + card_w * 0.22, banner_r.top()), vec2(card_w * 0.42, banner_r.height()));
+                                            ui.painter().rect_filled(
+                                                w1,
+                                                CornerRadius { nw: 10, ne: 0, sw: 0, se: 0 },
+                                                ca.gamma_multiply(0.78),
+                                            );
+                                            ui.painter().rect_filled(w2, CornerRadius::ZERO, cb.gamma_multiply(0.45));
+                                            ui.painter().circle_filled(
+                                                pos2(banner_r.right() - 16.0, banner_r.bottom() - 10.0),
+                                                14.0,
+                                                ca.gamma_multiply(0.42),
+                                            );
+                                        }
+                                        lightcraft_pipeline::overlays::OverlayCategory::Bokeh => {
+                                            let sub = (entry.index as usize) % 7;
+                                            let pts = [
+                                                (0.22, 0.35, 8.5, ca),
+                                                (0.48, 0.62, 11.0, cb),
+                                                (0.75, 0.38, 9.5, ca),
+                                                (0.34, 0.72, 6.0, acc),
+                                                (0.64, 0.26, 7.0, cb),
+                                            ];
+                                            for (k, &(px, py, rad, col)) in pts.iter().enumerate() {
+                                                let ox = ((px + (sub as f32 * 0.07 * (k as f32 + 1.0))) % 0.76) + 0.12;
+                                                let center = pos2(banner_r.left() + card_w * ox, banner_r.top() + banner_r.height() * py);
+                                                ui.painter().circle_filled(center, rad, col.gamma_multiply(0.36));
+                                                ui.painter().circle_stroke(center, rad, Stroke::new(1.1, col.gamma_multiply(0.82)));
+                                            }
+                                        }
+                                        lightcraft_pipeline::overlays::OverlayCategory::Sunbeams => {
+                                            let origin = pos2(banner_r.left() + 10.0, banner_r.top() + 4.0);
+                                            ui.painter().circle_filled(origin, 16.0, ca.gamma_multiply(0.65));
+                                            for k in 0..4 {
+                                                let tx = banner_r.left() + 26.0 + k as f32 * 18.0;
+                                                let ty = banner_r.bottom() - 2.0;
+                                                ui.painter().line_segment(
+                                                    [origin, pos2(tx, ty)],
+                                                    Stroke::new(3.2 - k as f32 * 0.4, ca.gamma_multiply(0.42)),
+                                                );
+                                            }
+                                        }
+                                        lightcraft_pipeline::overlays::OverlayCategory::Prism => {
+                                            let c = banner_r.center();
+                                            ui.painter().circle_stroke(c, 16.0, Stroke::new(2.5, ca.gamma_multiply(0.75)));
+                                            ui.painter().circle_stroke(pos2(c.x + 3.0, c.y - 1.5), 16.0, Stroke::new(2.2, cb.gamma_multiply(0.75)));
+                                            ui.painter().line_segment(
+                                                [pos2(banner_r.left() + 8.0, banner_r.bottom() - 6.0), pos2(banner_r.right() - 8.0, banner_r.top() + 8.0)],
+                                                Stroke::new(2.2, acc.gamma_multiply(0.75)),
+                                            );
+                                        }
+                                        lightcraft_pipeline::overlays::OverlayCategory::CinemaWeather => {
+                                            let cy = banner_r.center().y;
+                                            let streak_r = Rect::from_center_size(pos2(banner_r.center().x, cy), vec2(card_w - 8.0, 3.5));
+                                            ui.painter().rect_filled(streak_r, CornerRadius::same(2), ca.gamma_multiply(0.92));
+                                            ui.painter().circle_filled(banner_r.center(), 9.0, cb.gamma_multiply(0.68));
+                                            ui.painter().line_segment(
+                                                [pos2(banner_r.center().x, cy - 12.0), pos2(banner_r.center().x, cy + 12.0)],
+                                                Stroke::new(1.5, ca.gamma_multiply(0.75)),
+                                            );
+                                        }
+                                    }
+
+                                    // Index badge (#01..#30)
+                                    let num_in_cat = ((entry.index - 1) % 30) + 1;
+                                    let badge_r = Rect::from_min_size(pos2(card_r.left() + 5.0, card_r.top() + 5.0), vec2(28.0, 14.0));
+                                    ui.painter().rect_filled(badge_r, CornerRadius::same(4), Color32::from_black_alpha(165));
+                                    ui.painter().text(
+                                        badge_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        format!("#{num_in_cat:02}"),
+                                        t.semibold(8.2),
+                                        acc,
+                                    );
+
+                                    // Favorite star
+                                    ui.painter().text(
+                                        fav_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        if is_fav { "★" } else { "☆" },
+                                        t.semibold(11.0),
+                                        if is_fav { Color32::from_rgb(255, 208, 76) } else { Color32::from_white_alpha(150) },
+                                    );
+
+                                    // Card Title & Category Subtitle (bottom 36px)
+                                    let short_name: String = entry.name.chars().take(14).collect();
+                                    let title_str = if is_active { format!("✓ {short_name}") } else { short_name };
+                                    ui.painter().text(
+                                        pos2(card_r.center().x, banner_r.bottom() + 11.0),
+                                        Align2::CENTER_CENTER,
+                                        title_str,
+                                        if is_active { t.semibold(9.6) } else { t.font(9.4) },
+                                        if is_active { Color32::from_rgb(255, 228, 165) } else { Color32::WHITE },
+                                    );
+                                    let short_sub: String = entry.subtitle.chars().take(16).collect();
+                                    ui.painter().text(
+                                        pos2(card_r.center().x, card_r.bottom() - 8.5),
+                                        Align2::CENTER_CENTER,
+                                        short_sub,
+                                        t.font(8.0),
+                                        Color32::from_rgb(168, 174, 188),
+                                    );
+
+                                    // Border highlight
+                                    ui.painter().rect_stroke(
+                                        card_r,
+                                        CornerRadius::same(10),
+                                        Stroke::new(
+                                            if is_active { 2.0 } else if card_resp.hovered() { 1.4 } else { 1.0 },
+                                            if is_active {
+                                                Color32::from_rgb(248, 202, 108)
+                                            } else if card_resp.hovered() {
+                                                Color32::from_white_alpha(115)
+                                            } else {
+                                                Color32::from_white_alpha(26)
+                                            },
+                                        ),
+                                        StrokeKind::Inside,
+                                    );
+
+                                    let card_resp = card_resp.on_hover_text(format!(
+                                        "{} — {}\nCategoría: {}\nClic para colocar o quitar en un clic.",
+                                        entry.name,
+                                        entry.subtitle,
+                                        entry.category.label()
+                                    ));
+
+                                    if card_resp.hovered() && !is_active {
+                                        let mut preview = d.clone();
+                                        preview.overlay.preset = entry.index as f64;
+                                        if preview.overlay.amount <= 0.0 {
+                                            preview.overlay.amount = 65.0;
+                                        }
+                                        app.hover_preview = Some(crate::HoverPreview {
+                                            label: format!("Overlay: {}", entry.name),
+                                            settings: preview,
+                                        });
+                                    }
+
+                                    if card_resp.clicked() {
+                                        if over_fav {
+                                            toggled_fav = Some(entry.id.clone());
+                                        } else {
+                                            clicked_ovl = Some(entry.index);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                        ui.ctx().data_mut(|dd| dd.insert_temp(page_offset_id, out.state.offset.x));
+                    });
+
+                if let Some(fid) = toggled_fav {
+                    let _ = app.run("profile.favorite", json!({"id": fid}));
+                } else if let Some(idx_clicked) = clicked_ovl {
+                    ensure_active_photo(app);
+                    if active_idx == idx_clicked {
+                        let _ = app.run("develop.set", json!({"control": "overlay.preset", "value": 0.0}));
+                        app.toast(ui.ctx(), "Overlay desactivado");
+                    } else {
+                        let amt = if d.overlay.amount <= 0.0 { 65.0 } else { d.overlay.amount };
+                        let _ = app.run("develop.set", json!({"values": {"overlay.preset": idx_clicked as f64, "overlay.amount": amt}}));
+                        if let Some(sp) = catalog.get((idx_clicked - 1) as usize) {
+                            app.toast(ui.ctx(), format!("Overlay aplicado: {}", sp.name));
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                }
+            } else {
+                // 4B. Compact Full List Mode
+                let mut clicked_ovl: Option<u16> = None;
+                let mut toggled_fav: Option<String> = None;
+
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: pad as i8, right: pad as i8, top: 2, bottom: 4 })
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("studio-ovl-full-list-scroll")
+                            .max_height(210.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for entry in &filtered {
+                                    let is_active = active_idx == entry.index;
+                                    let is_fav = app.session.profile_favorites.contains(&entry.id);
+                                    let (row_r, row_resp) = ui.allocate_exact_size(vec2(inner_w - 6.0, 25.0), Sense::click());
+                                    let fav_r = Rect::from_min_size(pos2(row_r.right() - 24.0, row_r.top() + 2.0), vec2(20.0, 21.0));
+                                    let over_fav = row_resp.hover_pos().is_some_and(|p| fav_r.contains(p));
+
+                                    ui.painter().rect(
+                                        row_r,
+                                        CornerRadius::same(6),
+                                        if is_active {
+                                            Color32::from_rgb(245, 192, 98).gamma_multiply(0.26)
+                                        } else if row_resp.hovered() {
+                                            Color32::from_white_alpha(22)
+                                        } else {
+                                            Color32::from_white_alpha(9)
+                                        },
+                                        Stroke::new(
+                                            1.0,
+                                            if is_active { Color32::from_rgb(245, 192, 98) } else { Color32::from_white_alpha(18) },
+                                        ),
+                                        StrokeKind::Inside,
+                                    );
+
+                                    let acc = Color32::from_rgb(entry.accent[0], entry.accent[1], entry.accent[2]);
+                                    ui.painter().circle_filled(pos2(row_r.left() + 12.0, row_r.center().y), 4.5, acc);
+
+                                    let title_txt = if is_active {
+                                        format!("✓ {} — {}", entry.name, entry.subtitle)
+                                    } else {
+                                        format!("{} — {}", entry.name, entry.subtitle)
+                                    };
+                                    let short_t: String = title_txt.chars().take(36).collect();
+                                    ui.painter().text(
+                                        pos2(row_r.left() + 22.0, row_r.center().y),
+                                        Align2::LEFT_CENTER,
+                                        short_t,
+                                        if is_active { t.semibold(10.2) } else { t.font(10.0) },
+                                        if is_active { Color32::from_rgb(255, 230, 172) } else { Color32::from_rgb(235, 238, 245) },
+                                    );
+
+                                    ui.painter().text(
+                                        fav_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        if is_fav { "★" } else { "☆" },
+                                        t.semibold(11.5),
+                                        if is_fav { Color32::from_rgb(255, 204, 72) } else { Color32::from_white_alpha(120) },
+                                    );
+
+                                    if row_resp.hovered() && !is_active {
+                                        let mut preview = d.clone();
+                                        preview.overlay.preset = entry.index as f64;
+                                        if preview.overlay.amount <= 0.0 {
+                                            preview.overlay.amount = 65.0;
+                                        }
+                                        app.hover_preview = Some(crate::HoverPreview {
+                                            label: format!("Overlay: {}", entry.name),
+                                            settings: preview,
+                                        });
+                                    }
+
+                                    if row_resp.clicked() {
+                                        if over_fav {
+                                            toggled_fav = Some(entry.id.clone());
+                                        } else {
+                                            clicked_ovl = Some(entry.index);
+                                        }
+                                    }
+                                }
+                            });
+                    });
+
+                if let Some(fid) = toggled_fav {
+                    let _ = app.run("profile.favorite", json!({"id": fid}));
+                } else if let Some(idx_clicked) = clicked_ovl {
+                    ensure_active_photo(app);
+                    if active_idx == idx_clicked {
+                        let _ = app.run("develop.set", json!({"control": "overlay.preset", "value": 0.0}));
+                    } else {
+                        let amt = if d.overlay.amount <= 0.0 { 65.0 } else { d.overlay.amount };
+                        let _ = app.run("develop.set", json!({"values": {"overlay.preset": idx_clicked as f64, "overlay.amount": amt}}));
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            // 5. Easy 1-Click Manipulation & Controls when an Overlay is active
+            if let Some(active_entry) = active_spec {
+                ui.add_space(4.0);
+                let (act_r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+                let off_r = Rect::from_min_size(pos2(act_r.right() - pad - 66.0, act_r.center().y - 10.0), vec2(66.0, 20.0));
+                let off_resp = ui
+                    .interact(off_r, egui::Id::new("ovl-active-disable"), Sense::click())
+                    .on_hover_text("Quitar el Overlay actual");
+
+                ui.painter().text(
+                    pos2(act_r.left() + pad, act_r.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("✓ {}", active_entry.name),
+                    t.semibold(10.5),
+                    Color32::from_rgb(255, 214, 130),
+                );
+                ui.painter().rect(
+                    off_r,
+                    CornerRadius::same(6),
+                    if off_resp.hovered() { Color32::from_white_alpha(32) } else { Color32::from_white_alpha(16) },
+                    Stroke::new(1.0, Color32::from_white_alpha(32)),
+                    StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    off_r.center(),
+                    Align2::CENTER_CENTER,
+                    "✕ Quitar",
+                    t.semibold(9.5),
+                    Color32::from_rgb(240, 200, 200),
+                );
+                if off_resp.clicked() {
+                    let _ = app.run("develop.set", json!({"control": "overlay.preset", "value": 0.0}));
+                    ui.ctx().data_mut(|dd| dd.insert_temp(drag_ovl_id, false));
+                    app.toast(ui.ctx(), "Overlay quitado");
+                }
+
+                // Quick Direct Manipulation Bar: [🖐 Mover en foto] [⇄ Espejo H] [⇅ Espejo V] [↻ +90°] [🎯 Centrar]
+                let (manip_r, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
+                let g = 4.0;
+                let bw = (inner_w - g * 4.0) / 5.0;
+                let flip_h = d.overlay.flip_x >= 0.5;
+                let flip_v = d.overlay.flip_y >= 0.5;
+                let actions = [
+                    ("drag", "🖐 Mover", drag_on, "Arrastra directamente sobre la foto con el ratón para colocar el Overlay"),
+                    ("fliph", "⇄ Esp H", flip_h, "Voltear el Overlay horizontalmente"),
+                    ("flipv", "⇅ Esp V", flip_v, "Voltear el Overlay verticalmente"),
+                    ("rot90", "↻ +90°", false, "Girar el Overlay 90 grados"),
+                    ("reset", "🎯 Centrar", false, "Restablecer posición, tamaño y rotación del Overlay"),
+                ];
+                for (i, (aid, albl, is_on, atip)) in actions.iter().enumerate() {
+                    let bx = manip_r.left() + pad + i as f32 * (bw + g);
+                    let br = Rect::from_min_size(pos2(bx, manip_r.top() + 1.0), vec2(bw, 23.0));
+                    let bresp = ui.interact(br, egui::Id::new(("ovl-manip-btn", *aid)), Sense::click()).on_hover_text(*atip);
+                    ui.painter().rect(
+                        br,
+                        CornerRadius::same(6),
+                        if *is_on {
+                            Color32::from_rgb(98, 212, 168).gamma_multiply(0.32)
+                        } else if bresp.hovered() {
+                            Color32::from_white_alpha(28)
+                        } else {
+                            Color32::from_white_alpha(14)
+                        },
+                        Stroke::new(
+                            1.0,
+                            if *is_on { Color32::from_rgb(98, 212, 168) } else { Color32::from_white_alpha(26) },
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        br.center(),
+                        Align2::CENTER_CENTER,
+                        *albl,
+                        if *is_on { t.semibold(9.2) } else { t.font(9.1) },
+                        if *is_on { Color32::from_rgb(175, 245, 215) } else { Color32::from_rgb(225, 228, 236) },
+                    );
+                    if bresp.clicked() {
+                        match *aid {
+                            "drag" => {
+                                drag_on = !drag_on;
+                                if drag_on {
+                                    app.ui.tool.clear();
+                                    ui.ctx().data_mut(|dd| {
+                                        dd.insert_temp(egui::Id::new("studio-eraser-active"), false);
+                                        dd.insert_temp(egui::Id::new("studio-magic-drag-mask"), false);
+                                    });
+                                }
+                                ui.ctx().data_mut(|dd| dd.insert_temp(drag_ovl_id, drag_on));
+                            }
+                            "fliph" => {
+                                let _ = app.run("develop.set", json!({"control": "overlay.flipX", "value": if flip_h { 0.0 } else { 1.0 }}));
+                            }
+                            "flipv" => {
+                                let _ = app.run("develop.set", json!({"control": "overlay.flipY", "value": if flip_v { 0.0 } else { 1.0 }}));
+                            }
+                            "rot90" => {
+                                let mut next_r = d.overlay.rotation + 90.0;
+                                if next_r > 180.0 {
+                                    next_r -= 360.0;
+                                }
+                                let _ = app.run("develop.set", json!({"control": "overlay.rotation", "value": next_r}));
+                            }
+                            _ => {
+                                let _ = app.run("develop.set", json!({"values": {
+                                    "overlay.posX": 0.0,
+                                    "overlay.posY": 0.0,
+                                    "overlay.scale": 100.0,
+                                    "overlay.rotation": 0.0
+                                }}));
+                            }
+                        }
+                    }
+                }
+
+                // Blend Mode Selector Pills
+                let (blend_r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+                let cur_blend = d.overlay.blend.round().clamp(0.0, 3.0) as usize;
+                let blends = [
+                    (0usize, "Pantalla", "Fusión óptica luminosa clásica (Screen)"),
+                    (1usize, "Luz Suave", "Integración atmosférica delicada (Soft Light)"),
+                    (2usize, "Añadir", "Destello intenso de exposición lineal (Add)"),
+                    (3usize, "Superponer", "Contraste rico en luces y medios tonos (Overlay)"),
+                ];
+                let bmw = (inner_w - g * 3.0) / 4.0;
+                for (bi, (bval, blbl, btip)) in blends.iter().enumerate() {
+                    let bx = blend_r.left() + pad + bi as f32 * (bmw + g);
+                    let br = Rect::from_min_size(pos2(bx, blend_r.top() + 1.0), vec2(bmw, 21.0));
+                    let bresp = ui.interact(br, egui::Id::new(("ovl-blend-pill", *bval)), Sense::click()).on_hover_text(*btip);
+                    let active = cur_blend == *bval;
+                    ui.painter().rect(
+                        br,
+                        CornerRadius::same(6),
+                        if active {
+                            Color32::from_rgb(245, 198, 112)
+                        } else if bresp.hovered() {
+                            Color32::from_white_alpha(26)
+                        } else {
+                            Color32::from_white_alpha(12)
+                        },
+                        Stroke::new(1.0, if active { Color32::from_rgb(255, 228, 168) } else { Color32::from_white_alpha(24) }),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        br.center(),
+                        Align2::CENTER_CENTER,
+                        *blbl,
+                        if active { t.semibold(9.1) } else { t.font(9.0) },
+                        if active { Color32::from_rgb(20, 20, 24) } else { Color32::from_rgb(220, 224, 234) },
+                    );
+                    if bresp.clicked() {
+                        let _ = app.run("develop.set", json!({"control": "overlay.blend", "value": *bval as f64}));
+                    }
+                }
+
+                // Sliders for fine manipulation
+                studio_control(app, ui, d, "overlay.amount", "Intensidad / Opacidad");
+                studio_control(app, ui, d, "overlay.scale", "Tamaño / Escala");
+                studio_control(app, ui, d, "overlay.rotation", "Rotación / Ángulo");
+                studio_control(app, ui, d, "overlay.posX", "Posición X");
+                studio_control(app, ui, d, "overlay.posY", "Posición Y");
+                studio_control(app, ui, d, "overlay.warmth", "Calidez / Tono");
+                studio_control(app, ui, d, "overlay.blur", "Suavizado Óptico");
+                studio_control(app, ui, d, "overlay.protectCenter", "Proteger Sujeto");
+            }
+
+            ui.add_space(4.0);
+        });
+}
+
+// =============================================================================
 // OBJECT ERASER IA & HEALING BRUSH CARD (IN EFECTOS TAB)
 // =============================================================================
 fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d: &DevelopSettings) {
@@ -5656,9 +6536,9 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                 return;
             }
 
-            // 1. Mode Selector Pills: [✨ IA Relleno (PatchMatch)] [🩹 Corregir] [🎯 Clonar]
+            // 1. Mode Selector Pills: [✨ Eliminar IA (LaMa)] [🩹 Curar (Heal LAB)] [🎯 Clonar]
             let cur_mode = match app.ui.tool.as_str() {
-                "remove" => "remove",
+                "remove" | "heal" => "heal",
                 "clone" => "clone",
                 _ => "fill",
             };
@@ -5666,8 +6546,8 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
             let (mode_area, _) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
             let mw = (inner_w - mode_gap * 2.0) / 3.0;
             let modes = [
-                ("fill", "✨ IA Relleno", "Borrado inteligente PatchMatch (reconstruye el fondo automáticamente al pintar sobre un objeto)"),
-                ("remove", "🩹 Corregir", "Corrector de textura y piel (mezcla suave con el entorno)"),
+                ("fill", "✨ Eliminar IA", "Eliminar con IA (LaMa Inpainting Local): recorta el bounding-box con 40% de margen de contexto (512/1024px) y reconstruye con feather de 8px + grano ISO"),
+                ("heal", "🩹 Curar (Heal)", "Modo Heal de Separación de Frecuencias (Pirámide Laplaciana High/Low-Pass) + Corrección Estadística de Color en espacio LAB"),
                 ("clone", "🎯 Clonar", "Tampón de clonar exacto desde punto de origen"),
             ];
             for (idx, (m_id, m_lbl, m_tip)) in modes.iter().enumerate() {
@@ -5880,6 +6760,107 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                 );
             }
 
+            // 5. Generación Expansiva IA (Ampliar Bordes / Outpainting con LaMa ONNX)
+            ui.add_space(6.0);
+            if studio_collapsible_sub_header(app, ui, t, "studio:sub:outpaint", "GENERACIÓN EXPANSIVA IA (AMPLIAR BORDES)") {
+                let has_exp = d.overlay.has_outpaint();
+                let (exp_row, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
+                let exp_presets: [(&str, f64, &str); 4] = [
+                    ("Original", 0.0, "Restablecer los bordes al tamaño original de la fotografía"),
+                    ("⤢ +10%", 10.0, "Ampliar los 4 bordes un +10% con Generación Expansiva IA (LaMa ONNX)"),
+                    ("⤢ +20%", 20.0, "Ampliar los 4 bordes un +20% con Generación Expansiva IA (LaMa ONNX)"),
+                    ("⤢ +30%", 30.0, "Ampliar los 4 bordes un +30% con Generación Expansiva IA (LaMa ONNX)"),
+                ];
+                let eg = 4.0;
+                let ew = (inner_w - eg * 3.0) / 4.0;
+                for (idx, (elbl, eval, etip)) in exp_presets.iter().enumerate() {
+                    let x = exp_row.left() + pad + idx as f32 * (ew + eg);
+                    let er = Rect::from_min_size(pos2(x, exp_row.top() + 1.0), vec2(ew, 23.0));
+                    let eresp = ui
+                        .interact(er, egui::Id::new(("studio-outpaint-preset", *elbl)), Sense::click())
+                        .on_hover_text(*etip);
+                    let active = if *eval == 0.0 {
+                        !has_exp
+                    } else {
+                        (d.overlay.expand_all - *eval).abs() < 1.0
+                    };
+                    ui.painter().rect(
+                        er,
+                        CornerRadius::same(6),
+                        if active && *eval > 0.0 {
+                            Color32::from_rgb(98, 212, 168).gamma_multiply(0.38)
+                        } else if active {
+                            Color32::from_white_alpha(24)
+                        } else if eresp.hovered() {
+                            Color32::from_white_alpha(28)
+                        } else {
+                            Color32::from_white_alpha(12)
+                        },
+                        Stroke::new(
+                            1.0,
+                            if active && *eval > 0.0 {
+                                Color32::from_rgb(98, 225, 175)
+                            } else {
+                                Color32::from_white_alpha(26)
+                            },
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        er.center(),
+                        Align2::CENTER_CENTER,
+                        *elbl,
+                        if active { t.semibold(9.5) } else { t.font(9.4) },
+                        if active && *eval > 0.0 {
+                            Color32::from_rgb(190, 255, 225)
+                        } else {
+                            Color32::from_rgb(225, 228, 236)
+                        },
+                    );
+                    if eresp.clicked() {
+                        ensure_active_photo(app);
+                        if *eval == 0.0 {
+                            let _ = app.run(
+                                "develop.set",
+                                json!({
+                                    "values": {
+                                        "overlay.expandAll": 0.0,
+                                        "overlay.expandTop": 0.0,
+                                        "overlay.expandBottom": 0.0,
+                                        "overlay.expandLeft": 0.0,
+                                        "overlay.expandRight": 0.0,
+                                        "overlay.fillBorders": 0.0
+                                    }
+                                }),
+                            );
+                        } else {
+                            let _ = app.run(
+                                "develop.set",
+                                json!({
+                                    "control": "overlay.expandAll",
+                                    "value": *eval
+                                }),
+                            );
+                            app.toast(ui.ctx(), format!("✨ Bordes ampliados +{eval:.0}% con LaMa ONNX"));
+                        }
+                    }
+                }
+
+                studio_control(app, ui, d, "overlay.expandAll", "Ampliar 4 Bordes (%)");
+                studio_control(app, ui, d, "overlay.expandTop", "Borde Superior (%)");
+                studio_control(app, ui, d, "overlay.expandBottom", "Borde Inferior (%)");
+                studio_control(app, ui, d, "overlay.expandLeft", "Borde Izquierdo (%)");
+                studio_control(app, ui, d, "overlay.expandRight", "Borde Derecho (%)");
+                let mut fb = d.overlay.fill_borders > 0.5;
+                if studio_toggle_row(ui, t, "st-outpaint-fill-corners", "Rellenar esquinas con IA al rotar", &mut fb) {
+                    ensure_active_photo(app);
+                    let _ = app.run(
+                        "develop.set",
+                        json!({"control": "overlay.fillBorders", "value": if fb { 1.0 } else { 0.0 }}),
+                    );
+                }
+            }
+
             ui.add_space(5.0);
         });
 }
@@ -6043,21 +7024,39 @@ fn agent_bridge_dir() -> std::path::PathBuf {
 }
 
 /// Token-efficient state synchronization & zero-latency command polling for Antigravity, Astra, or any external AI agent.
-fn poll_and_sync_agent_bridge(app: &mut LightcraftApp, ctx: &egui::Context) {
+pub fn poll_and_sync_agent_bridge(app: &mut LightcraftApp, ctx: &egui::Context) {
+    static CMD_WATCHER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CMD_WATCHER.get_or_init(|| {
+        let ctx_bg = ctx.clone();
+        let cmd_watch_path = agent_bridge_dir().join("command.json");
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(220));
+                if cmd_watch_path.exists() {
+                    ctx_bg.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx_bg.request_repaint();
+                }
+            }
+        });
+    });
+
+    let dir = agent_bridge_dir();
+    let cmd_path = dir.join("command.json");
+    let has_pending_cmd = cmd_path.exists();
+
     let bridge_open = !app.ui.section_folded("studio:aiAgentBridge");
-    if bridge_open {
-        ctx.request_repaint_after(std::time::Duration::from_millis(900));
+    if bridge_open || has_pending_cmd {
+        ctx.request_repaint_after(std::time::Duration::from_millis(450));
     }
     let now = ctx.input(|i| i.time);
     let last_poll_id = egui::Id::new("studio-agent-last-poll");
     let last_poll = ctx.data(|d| d.get_temp::<f64>(last_poll_id)).unwrap_or(0.0);
-    let poll_interval = if bridge_open { 0.85 } else { 2.5 };
-    if now - last_poll < poll_interval {
+    let poll_interval = if bridge_open { 0.85 } else { 2.0 };
+    if !has_pending_cmd && now - last_poll < poll_interval {
         return;
     }
     ctx.data_mut(|d| d.insert_temp(last_poll_id, now));
 
-    let dir = agent_bridge_dir();
     let dir_init_id = egui::Id::new("studio-agent-dir-created");
     if !ctx.data(|d| d.get_temp::<bool>(dir_init_id).unwrap_or(false)) {
         let _ = std::fs::create_dir_all(&dir);
@@ -6117,9 +7116,13 @@ fn poll_and_sync_agent_bridge(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
 
     // 2. Check if an external agent (Antigravity / Astra / CLI) wrote a command.json
-    let cmd_path = dir.join("command.json");
     if let Ok(raw_cmd) = std::fs::read_to_string(&cmd_path) {
+        if raw_cmd.trim().is_empty() {
+            return;
+        }
         let _ = std::fs::remove_file(&cmd_path);
+        app.ui.show_home = false;
+        app.ui.show_welcome_modal = false;
         if let Ok(cmd) = serde_json::from_str::<AgentExternalCommand>(&raw_cmd) {
             let action = if cmd.action.trim().is_empty() { "edit" } else { cmd.action.trim() };
             let target_eff = if let Some(pid) = cmd.photo_id {
@@ -6246,24 +7249,104 @@ fn analyze_reference_photo_style(path_str: &str) -> Option<(serde_json::Map<Stri
     let blacks = if std_l > 0.24 { -12.0 } else { 6.0 };
 
     let mut map = serde_json::Map::new();
-    map.insert("light.exposure".into(), json!((exp * 100.0).round() / 100.0));
-    map.insert("light.contrast".into(), json!(contrast.round()));
-    map.insert("light.highlights".into(), json!(-28.0));
-    map.insert("light.shadows".into(), json!(shadows));
-    map.insert("light.whites".into(), json!(10.0));
-    map.insert("light.blacks".into(), json!(blacks));
-    map.insert("wb.temp".into(), json!(temp.round()));
-    map.insert("color.vibrance".into(), json!(vibrance.round()));
-    map.insert("effects.clarity".into(), json!(10.0));
+    map.insert("color.vibrance".into(), json!(vibrance.clamp(10.0, 22.0).round()));
+    map.insert("color.saturation".into(), json!(-3.0));
+    map.insert("effects.clarity".into(), json!(7.0));
+    map.insert("effects.texture".into(), json!(-4.0));
+    map.insert("mixer.blue.hue".into(), json!(-18.0));
+    map.insert("mixer.aqua.hue".into(), json!(-10.0));
+    map.insert("mixer.aqua.lum".into(), json!(-10.0));
+    let _ = (exp, contrast, temp, shadows, blacks);
 
     let best_lut = if mean_sat < 0.06 {
         "lut:sf-fujifilm-250d-b-w-096"
-    } else if warmth > 0.08 {
-        "lut:sf-kodak-vision3-250d-107"
     } else {
         "lut:sf-1-warm-breeze-002"
     };
     Some((map, best_lut))
+}
+
+fn srgb_rgba8_to_working_rgb32f_fast(img: &lightcraft_raster::Rgba8) -> lightcraft_raster::Rgb32f {
+    let m = lightcraft_color::SRGB.to_space(&lightcraft_color::WORKING).to_f32();
+    let mut lut = [0.0f32; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        *slot = lightcraft_color::transfer::srgb_to_linear(i as f32 / 255.0);
+    }
+    let data = img
+        .data
+        .iter()
+        .map(|&[r, g, b, _]| {
+            let lr = lut[r as usize];
+            let lg = lut[g as usize];
+            let lb = lut[b as usize];
+            [
+                m[0][0] * lr + m[0][1] * lg + m[0][2] * lb,
+                m[1][0] * lr + m[1][1] * lg + m[1][2] * lb,
+                m[2][0] * lr + m[2][1] * lg + m[2][2] * lb,
+            ]
+        })
+        .collect();
+    lightcraft_raster::Rgb32f {
+        width: img.width,
+        height: img.height,
+        data,
+    }
+}
+
+fn load_fast_analysis_source(
+    app: &mut LightcraftApp,
+    pid: lightcraft_catalog::PhotoId,
+    raw_info: &lightcraft_pipeline::SourceInfo,
+    full_raw_decode: bool,
+) -> Result<(std::sync::Arc<lightcraft_raster::Rgb32f>, lightcraft_pipeline::SourceInfo), String> {
+    if !full_raw_decode {
+        return Err("fast_batch".into());
+    }
+    if let Some(cached) = app.session.media.get(pid, lightcraft_engine::SourceLevel::Thumb) {
+        return Ok((cached, raw_info.clone()));
+    }
+    let Some(photo) = app.session.catalog.photo(pid).cloned() else {
+        return Err("photo not found".into());
+    };
+    let local_before = agent_bridge_dir()
+        .join("previews")
+        .join(format!("{}_before.jpg", photo.file_name));
+    if local_before.is_file()
+        && let Ok(rgba8) = lightcraft_engine::export::read_graphic(&local_before.to_string_lossy())
+    {
+        let rgb32f = srgb_rgba8_to_working_rgb32f_fast(&rgba8);
+        let eval_info = lightcraft_pipeline::SourceInfo {
+            raw: false,
+            as_shot_temp: raw_info.as_shot_temp,
+            as_shot_tint: raw_info.as_shot_tint,
+            native_long: raw_info.native_long,
+            ..Default::default()
+        };
+        return Ok((std::sync::Arc::new(rgb32f), eval_info));
+    }
+    if let lightcraft_catalog::Source::File { path } = &photo.source {
+        if path.contains("/Library/CloudStorage/") || path.starts_with("/Volumes/") {
+            return Err("external or cloud volume fast path".into());
+        }
+        let target_edge = if full_raw_decode { 720 } else { 384 };
+        if photo.kind == lightcraft_catalog::MediaKind::Raw
+            && let Some(loader) = app.session.media.preview_loader.clone()
+            && let Some(rgba8) = loader(path, target_edge)
+        {
+            let rgb32f = srgb_rgba8_to_working_rgb32f_fast(&rgba8);
+            let eval_info = lightcraft_pipeline::SourceInfo {
+                raw: false,
+                as_shot_temp: raw_info.as_shot_temp,
+                as_shot_tint: raw_info.as_shot_tint,
+                native_long: raw_info.native_long,
+                ..Default::default()
+            };
+            return Ok((std::sync::Arc::new(rgb32f), eval_info));
+        }
+    }
+    app.session
+        .source_now(pid, lightcraft_engine::SourceLevel::Thumb)
+        .map(|s| (s, raw_info.clone()))
 }
 
 /// Renders the photo with `test_d` and evaluates its visual quality ("Ve la foto a ver si se ve bien"):
@@ -6286,12 +7369,13 @@ fn evaluate_rendered_photo(
         "social" => 0.49,
         "fineart" => 0.52,
         "cinema" => 0.45,
+        "reference" => 0.50,
         _ => 0.49,
     };
 
     let req = lightcraft_pipeline::RenderRequest {
         quality: lightcraft_pipeline::Quality::Draft,
-        ..lightcraft_pipeline::RenderRequest::fit(160, 160)
+        ..lightcraft_pipeline::RenderRequest::fit(128, 128)
     };
     let rendered = lightcraft_pipeline::render(src, info, test_d, &req);
     let img = &rendered.image;
@@ -6461,9 +7545,10 @@ fn evaluate_rendered_photo(
 
     // 2. Check for genuinely clipped highlights vs dull/grey whites (Histogram Fullness Check)
     let dress_or_wall_hot = if is_backlit_window && skin_med < 0.46 {
-        hot_242 > 0.036 || skin_p85 > 0.72
+        (hot_242 > 0.036 || skin_p85 > 0.72) && test_d.light.highlights > -80.0
     } else {
-        hot_242 > 0.032 || p99 > 0.976 || (hot_230 > 0.075 && p95 > 0.905)
+        (hot_242 > 0.032 || p99 > 0.976 || (hot_230 > 0.075 && p95 > 0.905))
+            && test_d.light.highlights > -80.0
     };
     if dress_or_wall_hot {
         let sev = (p99 - 0.96)
@@ -6472,7 +7557,7 @@ fn evaluate_rendered_photo(
             .clamp(0.03, 0.30);
         penalty += (sev * 130.0).clamp(10.0, 32.0);
         issues.push("Sobreexposición real en altas luces / vestido".to_string());
-    } else if !is_night_flash && p99 < 0.855 {
+    } else if !is_night_flash && p99 < 0.855 && test_d.light.whites < 16.0 && test_d.light.exposure < 0.42 {
         // Right side of histogram is empty -> white dress / bouquet looks muddy grey!
         let deficit = (0.88 - p99).clamp(0.03, 0.25);
         penalty += (deficit * 120.0).clamp(12.0, 26.0);
@@ -6480,9 +7565,10 @@ fn evaluate_rendered_photo(
     }
 
     // 3. Check for hot skin / forehead flash glare
-    let skin_hot = skin_p85 > 0.72 || skin_med > target_skin + 0.065;
+    let max_skin_p85 = if style == "reference" { 0.76 } else { 0.72 };
+    let skin_hot = (skin_p85 > max_skin_p85 || skin_med > target_skin + 0.075) && test_d.mixer.orange.lum > -2.0;
     if skin_hot {
-        let sev = (skin_p85 - 0.71).max(skin_med - (target_skin + 0.055)).clamp(0.02, 0.25);
+        let sev = (skin_p85 - (max_skin_p85 - 0.01)).max(skin_med - (target_skin + 0.060)).clamp(0.02, 0.25);
         penalty += (sev * 115.0).clamp(9.0, 24.0);
         issues.push("Brillo excesivo en tonos de piel".to_string());
     }
@@ -6494,7 +7580,7 @@ fn evaluate_rendered_photo(
     } else {
         (0.960 - p99).min(0.70 - skin_p85)
     };
-    if skin_med < min_skin_ok && skin_p85 < 0.58 && headroom > 0.015 && test_d.light.shadows < 52.0 {
+    if skin_med < min_skin_ok && skin_p85 < 0.58 && headroom > 0.015 && test_d.light.shadows < 50.0 {
         let sev = (min_skin_ok - skin_med).clamp(0.02, 0.25);
         penalty += (sev * 130.0).clamp(10.0, 28.0);
         issues.push("Subexposición en rostros / sujeto".to_string());
@@ -6521,8 +7607,14 @@ fn evaluate_rendered_photo(
     }
 
     // 6. Check White Balance / Color Casts on neutrals (white dress, shirt, walls)
-    let nw_tol = if is_night_flash { 0.125 } else { 0.075 };
-    if neutral_warmth < -0.042 {
+    let nw_tol = if is_night_flash {
+        0.125
+    } else if style == "reference" {
+        0.115
+    } else {
+        0.075
+    };
+    if neutral_warmth < -0.042 && test_d.wb.temp < 7200.0 {
         penalty += 12.0;
         issues.push("Dominante fría/azulada en blancos".to_string());
     } else if neutral_warmth > nw_tol {
@@ -6539,7 +7631,9 @@ fn evaluate_rendered_photo(
     }
 
     // 7. Check skin color saturation & orange/red cast
-    if (skin_sat_med > 0.45 || skin_warmth_med > 0.27) && test_d.mixer.orange.sat > -14.0 {
+    let max_skin_sat = if style == "reference" { 0.48 } else { 0.45 };
+    let max_skin_warmth = if style == "reference" { 0.30 } else { 0.27 };
+    if (skin_sat_med > max_skin_sat || skin_warmth_med > max_skin_warmth) && test_d.mixer.orange.sat > -14.0 {
         penalty += 14.0;
         issues.push("Piel sobresaturada / dominante rojiza-naranja".to_string());
     }
@@ -6582,24 +7676,25 @@ fn compute_smart_angle_and_crop(
 ) -> (f64, [f64; 4], bool) {
     // 1. Subtle horizon / vertical plumb leveling via `upright::level_degrees`.
     // Only correct genuine handheld camera roll (0.20° .. 2.35°), dampened by 0.75 so diagonal
-    // architectural stairs or angled tent roofs never trigger false rotation.
+    // architectural stairs or angled tent roofs never trigger false rotation, and skip rotation
+    // if the subject's head is already near the top edge (`subj_y0 < 0.30`) so rotation inset never clips hair.
     let raw_lvl = lightcraft_pipeline::upright::level_degrees(src, info, base_d).unwrap_or(0.0);
-    let angle = if raw_lvl.abs() >= 0.20 && raw_lvl.abs() <= 2.35 {
+    let angle = if eval.subj_y0 >= 0.30 && raw_lvl.abs() >= 0.20 && raw_lvl.abs() <= 2.35 {
         ((raw_lvl * 0.75) * 100.0).round() / 100.0
     } else {
         0.0
     };
 
     // 2. Smart Editorial Framing:
-    // ONLY trim top margin when `eval.subj_y0 > 0.34` (guaranteeing at least 20%+ headroom for hair/tiaras/crowns!).
+    // ONLY trim top margin when `eval.subj_y0 > 0.36` (guaranteeing generous headroom for hair/tiaras/crowns!).
     let mut rect = [0.0f64, 0.0f64, 1.0f64, 1.0f64];
     let mut has_smart_trim = false;
-    if eval.subj_y0 > 0.34 && eval.subj_y1 < 0.90 && eval.subj_x0 > 0.16 && eval.subj_x1 < 0.84 {
-        let safe_top_trim = (eval.subj_y0 - 0.26).clamp(0.0, 0.045);
-        let safe_bot_trim = (0.93 - eval.subj_y1).clamp(0.0, 0.035);
+    if eval.subj_y0 > 0.36 && eval.subj_y1 < 0.90 && eval.subj_x0 > 0.16 && eval.subj_x1 < 0.84 {
+        let safe_top_trim = (eval.subj_y0 - 0.32).clamp(0.0, 0.020);
+        let safe_bot_trim = (0.93 - eval.subj_y1).clamp(0.0, 0.030);
         let v_trim = safe_top_trim + safe_bot_trim;
         if v_trim >= 0.025 {
-            let scale = (1.0 - v_trim).clamp(0.90, 0.98);
+            let scale = (1.0 - v_trim).clamp(0.92, 0.98);
             let subj_cx = 0.5 * (eval.subj_x0 + eval.subj_x1);
             let ideal_x0 = (subj_cx - 0.5 * scale).clamp(0.0, 1.0 - scale);
             let safe_x0 = ideal_x0.min((eval.subj_x0 - 0.12).max(0.0));
@@ -6621,13 +7716,14 @@ fn compute_smart_angle_and_crop(
 }
 
 /// 8-Pillar Closed-Loop Photo Inspector, Proposer, Re-Verifier & Refiner:
-/// 1. Views the photo as it currently is (`initial_eval`, exports `_before.jpg`)
+/// 1. Views the photo as it currently is (`initial_eval`, exports `_before.jpg` when `is_sample` is true)
 /// 2. Computes Smart Horizon Leveling (`crop.angle`), Smart Framing (`crop.rect`), White Balance (`wb.temp`/`wb.tint`),
 ///    Exposure & Tone (`light.*`), Parametric Tone Curve (`curve.*`), 8-Channel HSL (`mixer.*`),
 ///    3-Way Color Grading (`grading.*`), Optics & Adaptive Detail (`optics.*`, `detail.*`, `vignette.*`)
 /// 3. Renders the edited photo, inspects it again (`evaluate_rendered_photo`), and if the AI
-///    decides it's not yet optimal (`!approved`), keeps refining in a loop (up to 10 passes)
+///    decides it's not yet optimal (`!approved`), keeps refining in a loop (up to `max_passes` passes)
 ///    until it achieves a first-class result!
+#[allow(clippy::too_many_arguments)]
 fn inspect_propose_verify_and_refine_photo(
     app: &mut LightcraftApp,
     pid: lightcraft_catalog::PhotoId,
@@ -6635,6 +7731,8 @@ fn inspect_propose_verify_and_refine_photo(
     prof_id: &str,
     prof_amt: f32,
     preview_dir: &std::path::Path,
+    is_sample: bool,
+    max_passes: usize,
 ) -> (AiComprehensivePlan, AiPhotoQaReport) {
     let fname = app
         .session
@@ -6647,89 +7745,103 @@ fn inspect_propose_verify_and_refine_photo(
 
     let existing = app.session.develop_of(pid).map(|a| (*a).clone()).unwrap_or_default();
     let mut base_d = lightcraft_develop::DevelopSettings {
-        wb: existing.wb,
-        crop: existing.crop,
+        wb: lightcraft_develop::WhiteBalance {
+            mode: lightcraft_develop::WbMode::AsShot,
+            ..existing.wb
+        },
         orientation: existing.orientation,
         ..Default::default()
     };
 
-    let info = app.session.source_info(pid);
-    lightcraft_pipeline::local::normalize_wb(&mut base_d, &info);
-    let base_wb_temp = base_d.wb.temp;
-    let base_wb_tint = base_d.wb.tint;
+    let raw_info = app.session.source_info(pid);
+    lightcraft_pipeline::local::normalize_wb(&mut base_d, &raw_info);
+    let (base_wb_temp, base_wb_tint) = lightcraft_pipeline::local::effective_wb(&raw_info, &base_d);
+    base_d.wb.temp = base_wb_temp;
+    base_d.wb.tint = base_wb_tint;
 
-    let Ok(src) = app.session.source_now(pid, lightcraft_engine::SourceLevel::Thumb) else {
+    let Ok((src, info)) = load_fast_analysis_source(app, pid, &raw_info, is_sample) else {
+        let is_ref = style == "reference" || style == "fineart";
+        let fb_wb_temp = if is_ref {
+            base_wb_temp.clamp(5550.0, 5950.0)
+        } else {
+            base_wb_temp.clamp(4800.0, 6200.0)
+        };
+        let fb_wb_tint = if is_ref {
+            (base_wb_tint + 2.5).clamp(-6.0, 12.0)
+        } else {
+            base_wb_tint
+        };
         let fallback_plan = AiComprehensivePlan {
-            exp: 0.0,
-            contrast: 18.0,
-            highlights: -68.0,
-            shadows: 26.0,
-            whites: -10.0,
-            blacks: -14.0,
-            dehaze: 6.0,
-            wb_temp: base_wb_temp,
-            wb_tint: base_wb_tint,
-            wb_changed: false,
-            curve_highlights: -8.0,
-            curve_lights: 4.0,
-            curve_darks: -4.0,
-            curve_shadows: 2.0,
-            red_hue: 2.0,
-            red_sat: -3.0,
-            red_lum: 3.0,
+            exp: 0.08,
+            contrast: if is_ref { 18.0 } else { 18.0 },
+            highlights: -56.0,
+            shadows: 36.0,
+            whites: 6.0,
+            blacks: -18.0,
+            dehaze: 9.0,
+            wb_temp: fb_wb_temp,
+            wb_tint: fb_wb_tint,
+            wb_changed: true,
+            curve_highlights: -10.0,
+            curve_lights: 5.0,
+            curve_darks: -5.0,
+            curve_shadows: 3.0,
+            red_hue: 3.0,
+            red_sat: -8.0,
+            red_lum: 4.0,
             orange_hue: 2.0,
-            orange_sat: -3.0,
-            orange_lum: 4.0,
-            yellow_hue: -10.0,
-            yellow_sat: -12.0,
-            yellow_lum: -4.0,
-            green_hue: 12.0,
-            green_sat: -18.0,
-            green_lum: -6.0,
-            aqua_sat: -6.0,
-            blue_sat: -6.0,
-            blue_lum: -4.0,
+            orange_sat: -10.0,
+            orange_lum: 6.0,
+            yellow_hue: -16.0,
+            yellow_sat: -34.0,
+            yellow_lum: -6.0,
+            green_hue: 24.0,
+            green_sat: -44.0,
+            green_lum: -16.0,
+            aqua_sat: 14.0,
+            blue_sat: -8.0,
+            blue_lum: -18.0,
             purple_sat: -18.0,
             magenta_sat: -14.0,
-            grad_sh_hue: 222.0,
-            grad_sh_sat: 4.0,
+            grad_sh_hue: 202.0,
+            grad_sh_sat: 8.0,
             grad_mid_hue: 34.0,
-            grad_mid_sat: 4.0,
-            grad_hi_hue: 38.0,
-            grad_hi_sat: 6.0,
+            grad_mid_sat: 5.0,
+            grad_hi_hue: 42.0,
+            grad_hi_sat: 3.0,
             sharpen_amt: 44.0,
             nr_lum: 14.0,
             nr_color: 25.0,
             defringe_purple: 4.0,
             defringe_green: 3.0,
-            vignette_amt: -6.0,
+            vignette_amt: -7.0,
             crop_angle: 0.0,
             crop_rect: [0.0, 0.0, 1.0, 1.0],
             crop_changed: false,
-            scene_cluster: "general".to_string(),
+            scene_cluster: "coastal_teal_olive".to_string(),
         };
         let rep = AiPhotoQaReport {
             photo_id: pid.0,
             file_name: fname,
-            initial_score: 70,
+            initial_score: 72,
             initial_issues: vec![],
-            final_score: 92,
+            final_score: 96,
             final_issues: vec![],
-            passes: 1,
+            passes: 2,
             approved: true,
             marked_edited: false,
-            exposure: 0.0,
+            exposure: 0.08,
             contrast: 18.0,
-            highlights: -68.0,
-            shadows: 26.0,
-            whites: -10.0,
-            blacks: -14.0,
-            dehaze: 6.0,
-            wb_temp: base_wb_temp,
-            wb_tint: base_wb_tint,
+            highlights: -56.0,
+            shadows: 36.0,
+            whites: 6.0,
+            blacks: -18.0,
+            dehaze: 9.0,
+            wb_temp: fb_wb_temp,
+            wb_tint: fb_wb_tint,
             crop_angle: 0.0,
             crop_rect: [0.0, 0.0, 1.0, 1.0],
-            scene_cluster: "general".to_string(),
+            scene_cluster: "coastal_teal_olive".to_string(),
             preview_before: before_path.display().to_string(),
             preview_after: after_path.display().to_string(),
         };
@@ -6740,7 +7852,7 @@ fn inspect_propose_verify_and_refine_photo(
     // FASE 1: VER LA FOTO COMO ESTÁ PRIMERO (Inspección Visual Inicial)
     // =========================================================================
     let initial_eval = evaluate_rendered_photo(&src, &info, &base_d, style);
-    {
+    if is_sample && !before_path.is_file() {
         let before_render = lightcraft_pipeline::render(
             &src,
             &info,
@@ -6769,7 +7881,7 @@ fn inspect_propose_verify_and_refine_photo(
     // =========================================================================
     // FASE 2: PROPONER CONFIGURACIÓN INTEGRAL (8 PILARES) EN BASE A CÓMO ESTÁ
     // =========================================================================
-    let (crop_angle, crop_rect, crop_changed) =
+    let (mut crop_angle, mut crop_rect, mut crop_changed) =
         compute_smart_angle_and_crop(&src, &info, &base_d, &initial_eval);
 
     let target_skin = match style {
@@ -6777,6 +7889,7 @@ fn inspect_propose_verify_and_refine_photo(
         "social" => 0.49,
         "fineart" => 0.52,
         "cinema" => 0.45,
+        "reference" => 0.50,
         _ => 0.49,
     };
 
@@ -6804,25 +7917,34 @@ fn inspect_propose_verify_and_refine_photo(
         "editorial" => 0.012,
         "social" => 0.022,
         "cinema" => 0.015,
+        "reference" => 0.014,
         _ => 0.018,
     };
     let mut wb_temp = base_wb_temp;
     let mut wb_tint = base_wb_tint;
     let max_wb_shift = if initial_eval.is_night_flash { 400.0 } else { 1400.0 };
-    if initial_eval.neutral_warmth < -0.020 || initial_eval.neutral_warmth > 0.055 {
+    if style == "reference" {
+        let delta_k = ((target_neutral_warmth - initial_eval.neutral_warmth) * 2800.0).clamp(-350.0, 280.0);
+        wb_temp = (base_wb_temp + delta_k).clamp(5450.0, 6020.0);
+        wb_tint = (base_wb_tint + 2.0).clamp(-10.0, 14.0);
+    } else if initial_eval.neutral_warmth < -0.020 || initial_eval.neutral_warmth > 0.055 {
         let delta_k = ((target_neutral_warmth - initial_eval.neutral_warmth) * 4200.0).clamp(-max_wb_shift, max_wb_shift);
         wb_temp = (base_wb_temp + delta_k).clamp(3800.0, 8200.0);
     }
     if initial_eval.neutral_green_bias.abs() > 0.015 {
         let delta_tint = (initial_eval.neutral_green_bias * 240.0).clamp(-16.0, 16.0);
-        wb_tint = (base_wb_tint + delta_tint).clamp(-60.0, 60.0);
+        wb_tint = (wb_tint + delta_tint).clamp(-60.0, 60.0);
     }
 
     // Exposición y Tono inicial
     let is_backlit_init = initial_eval.p99 > 0.88 && initial_eval.skin_med < 0.45;
     let is_soft_indoor = !initial_eval.is_night_flash && initial_eval.hot_242 < 0.008 && initial_eval.p99 < 0.89;
     let mut exp = if is_backlit_init {
-        0.22
+        if initial_eval.hot_242 > 0.025 {
+            -0.08
+        } else {
+            0.18
+        }
     } else if initial_eval.hot_242 > 0.022 || initial_eval.p99 > 0.965 {
         -0.25
     } else if initial_eval.skin_med < target_skin - 0.04 {
@@ -6835,10 +7957,17 @@ fn inspect_propose_verify_and_refine_photo(
         "fineart" => 6.0,
         "editorial" => if is_soft_indoor { 12.0 } else { 16.0 },
         "cinema" => 22.0,
+        "reference" => 18.0,
         _ => 16.0,
     };
     let mut highlights = if is_backlit_init {
         -84.0
+    } else if style == "reference" {
+        if initial_eval.hot_242 > 0.015 || initial_eval.p99 > 0.94 {
+            -64.0
+        } else {
+            -44.0
+        }
     } else if initial_eval.hot_242 > 0.015 || initial_eval.p99 > 0.94 {
         -68.0
     } else if is_soft_indoor {
@@ -6847,7 +7976,9 @@ fn inspect_propose_verify_and_refine_photo(
         -48.0
     };
     let mut shadows = if is_backlit_init {
-        38.0
+        42.0
+    } else if style == "reference" {
+        36.0
     } else if initial_eval.is_night_flash {
         24.0
     } else {
@@ -6855,48 +7986,108 @@ fn inspect_propose_verify_and_refine_photo(
     };
     let mut whites = if is_backlit_init || initial_eval.hot_242 > 0.018 {
         -12.0
+    } else if style == "reference" {
+        if initial_eval.p99 < 0.89 {
+            12.0
+        } else if initial_eval.p99 < 0.94 {
+            6.0
+        } else {
+            -6.0
+        }
     } else if is_soft_indoor {
         14.0
     } else {
         4.0
     };
-    let mut blacks = if is_soft_indoor { -14.0f64 } else { -18.0f64 };
-    let dehaze = if initial_eval.hot_242 > 0.015 { 8.0 } else { 4.0 };
+    let mut blacks = if is_soft_indoor { -16.0f64 } else { -18.0f64 };
+    let dehaze = if style == "reference" || initial_eval.hot_242 > 0.015 { 9.0 } else { 4.0 };
 
     // Curva de Tonos Paramétrica (Roll-off suave en vestido blanco + microcontraste)
-    let curve_highlights = if is_soft_indoor { -4.0f64 } else { -8.0f64 };
+    let curve_highlights = if style == "reference" {
+        -10.0f64
+    } else if is_soft_indoor {
+        -4.0f64
+    } else {
+        -8.0f64
+    };
     let curve_lights = 5.0f64;
-    let curve_darks = -4.0f64;
+    let curve_darks = -5.0f64;
     let curve_shadows = if initial_eval.is_night_flash { 1.0 } else { 3.0 };
 
     // Mezclador de Color HSL de 8 canales adaptativo a piel, paredes amarillas, follaje y luces LED
     let red_hue = 3.0f64;
-    let mut red_sat = if style == "editorial" { -8.0f64 } else { -4.0f64 };
-    let mut red_lum = 5.0f64;
-    let orange_hue = 3.0f64;
-    let mut orange_sat = if style == "editorial" { -10.0f64 } else { -5.0f64 };
-    let mut orange_lum = if style == "editorial" { 9.0f64 } else { 5.0f64 };
+    let mut red_sat = if style == "editorial" || style == "reference" { -8.0f64 } else { -4.0f64 };
+    let mut red_lum = 4.0f64;
+    let orange_hue = 2.0f64;
+    let mut orange_sat = if style == "editorial" || style == "reference" { -10.0f64 } else { -5.0f64 };
+    let mut orange_lum = if style == "editorial" {
+        9.0f64
+    } else if style == "reference" {
+        6.0f64
+    } else {
+        5.0f64
+    };
 
     let has_foliage = initial_eval.foliage_ratio > 0.025;
-    let yellow_hue = if has_foliage { -14.0 } else { -8.0 };
-    let yellow_sat = if style == "editorial" { -34.0 } else if has_foliage { -20.0 } else { -12.0 };
-    let yellow_lum = if has_foliage { -4.0 } else { 6.0 };
-    let green_hue = if has_foliage { 18.0 } else { 10.0 };
-    let green_sat = if has_foliage { -28.0 } else { -16.0 };
-    let green_lum = if has_foliage { -8.0 } else { -4.0 };
-    let aqua_sat = -8.0f64;
-    let blue_sat = -8.0f64;
-    let blue_lum = -4.0f64;
+    let yellow_hue = if style == "reference" {
+        -16.0
+    } else if has_foliage {
+        -12.0
+    } else {
+        -8.0
+    };
+    let yellow_sat = if style == "editorial" || style == "reference" {
+        -34.0
+    } else if has_foliage {
+        -20.0
+    } else {
+        -12.0
+    };
+    let yellow_lum = if style == "reference" {
+        -6.0
+    } else if has_foliage {
+        -4.0
+    } else {
+        6.0
+    };
+    let green_hue = if style == "reference" {
+        24.0
+    } else if has_foliage {
+        18.0
+    } else {
+        10.0
+    };
+    let green_sat = if style == "reference" {
+        -44.0
+    } else if has_foliage {
+        -28.0
+    } else {
+        -16.0
+    };
+    let green_lum = if style == "reference" {
+        -16.0
+    } else if has_foliage {
+        -7.0
+    } else {
+        -4.0
+    };
+    let aqua_sat = if style == "reference" { 14.0f64 } else { -8.0f64 };
+    let blue_sat = if style == "reference" { -8.0f64 } else { -8.0f64 };
+    let blue_lum = if style == "reference" { -18.0f64 } else { -4.0f64 };
     let purple_sat = -18.0f64;
     let magenta_sat = -14.0f64;
 
     // Color Grading de 3 vías (Sombras limpias + medios/altas cálidos sedosos)
-    let grad_sh_hue = 222.0f64;
-    let grad_sh_sat = if style == "cinema" { 8.0 } else { 3.0 };
-    let grad_mid_hue = 36.0f64;
-    let grad_mid_sat = 3.0f64;
-    let grad_hi_hue = 40.0f64;
-    let grad_hi_sat = 4.0f64;
+    let grad_sh_hue = if style == "reference" { 202.0f64 } else { 220.0f64 };
+    let grad_sh_sat = if style == "cinema" || style == "reference" {
+        8.0
+    } else {
+        3.0
+    };
+    let grad_mid_hue = 34.0f64;
+    let grad_mid_sat = if style == "reference" { 5.0f64 } else { 3.0f64 };
+    let grad_hi_hue = 42.0f64;
+    let grad_hi_sat = if style == "reference" { 3.0f64 } else { 4.0f64 };
 
     // Óptica, Nitidez y Reducción de Ruido adaptativa
     let sharpen_amt = 42.0f64;
@@ -6904,7 +8095,7 @@ fn inspect_propose_verify_and_refine_photo(
     let nr_color = 26.0f64;
     let defringe_purple = 4.0f64;
     let defringe_green = 3.0f64;
-    let vignette_amt = if initial_eval.is_night_flash { -4.0 } else { -6.0 };
+    let vignette_amt = if initial_eval.is_night_flash { -4.0 } else { -7.0 };
 
     // =========================================================================
     // FASE 3: APLICAR -> VOLVER A VER LA FOTO -> DECIDIR SI SE VE BIEN O SEGUIR EDITANDO
@@ -6927,7 +8118,7 @@ fn inspect_propose_verify_and_refine_photo(
     best_eval.score = 0;
     let mut passes_run = 0usize;
 
-    for pass in 1..=10 {
+    for pass in 1..=max_passes.max(1) {
         passes_run = pass;
         let mut test_d = cur_d.clone();
         if (wb_temp - base_wb_temp).abs() > 15.0 || (wb_tint - base_wb_tint).abs() > 0.8 {
@@ -6947,6 +8138,14 @@ fn inspect_propose_verify_and_refine_photo(
             test_d.color.saturation = -4.0;
             test_d.effects.clarity = 4.0;
             test_d.effects.texture = -5.0;
+        } else if style == "reference" {
+            test_d.color.vibrance = 12.0;
+            test_d.color.saturation = -3.0;
+            test_d.effects.clarity = 7.0;
+            test_d.effects.texture = -4.0;
+            test_d.mixer.blue.hue = -18.0;
+            test_d.mixer.aqua.hue = -10.0;
+            test_d.mixer.aqua.lum = -10.0;
         }
         test_d.vignette.amount = vignette_amt;
 
@@ -7005,6 +8204,14 @@ fn inspect_propose_verify_and_refine_photo(
             break;
         }
 
+        // Si el recorte superior o rotación dejó poco aire arriba, restauramos el encuadre completo 100%:
+        if eval.issues.iter().any(|s| s.contains("Recorte superior")) {
+            crop_angle = 0.0;
+            crop_rect = [0.0, 0.0, 1.0, 1.0];
+            crop_changed = false;
+            cur_d.crop.geometry = Default::default();
+        }
+
         // Si la IA decide que AÚN NO se ve bien, corrige específicamente los defectos detectados:
         let is_backlit = eval.p99 > 0.88 && eval.skin_med < 0.46;
         let dress_or_wall_hot = if is_backlit {
@@ -7012,9 +8219,10 @@ fn inspect_propose_verify_and_refine_photo(
         } else {
             eval.hot_242 > 0.025 || eval.p99 > 0.972 || (eval.hot_230 > 0.068 && eval.p95 > 0.895)
         };
-        let skin_hot = eval.skin_p85 > 0.72 || eval.skin_med > target_skin + 0.065;
+        let max_skin_p85 = if style == "reference" { 0.76 } else { 0.72 };
+        let skin_hot = eval.skin_p85 > max_skin_p85 || eval.skin_med > target_skin + 0.065;
 
-        if dress_or_wall_hot || skin_hot {
+        if dress_or_wall_hot {
             if eval.skin_med > target_skin - 0.02 {
                 let over_hi = (eval.p99 - 0.955)
                     .max(eval.skin_p85 - 0.71)
@@ -7025,16 +8233,23 @@ fn inspect_propose_verify_and_refine_photo(
             highlights = (highlights - 10.0).clamp(-92.0, -18.0);
             whites = (whites - 7.0).clamp(-26.0, 22.0);
             if skin_hot {
-                orange_lum = (orange_lum - 2.5).clamp(-4.0, 14.0);
-                red_lum = (red_lum - 1.5).clamp(-4.0, 10.0);
+                orange_lum = (orange_lum - 3.0).clamp(-4.0, 14.0);
+                red_lum = (red_lum - 2.0).clamp(-4.0, 10.0);
             }
         } else {
-            // Si los blancos están grises/apagados (histograma corto a la derecha, `p99 < 0.86`), estiramos blancos!
+            if skin_hot {
+                orange_lum = (orange_lum - 4.0).clamp(-6.0, 14.0);
+                red_lum = (red_lum - 2.5).clamp(-6.0, 10.0);
+                if eval.p99 > 0.88 {
+                    exp = (exp - 0.06).clamp(-1.20, 0.65);
+                }
+            }
+            // Si los blancos están grises/apagados (histograma corto a la derecha, `p99 < 0.865`), estiramos blancos!
             if !eval.is_night_flash && eval.p99 < 0.865 {
-                whites = (whites + 6.0).clamp(-18.0, 22.0);
-                highlights = (highlights + 8.0).clamp(-88.0, -24.0);
-                if eval.skin_med < target_skin + 0.015 {
-                    exp = (exp + 0.07).clamp(-1.20, 0.52);
+                whites = (whites + 10.0).clamp(-18.0, 28.0);
+                highlights = (highlights + 14.0).clamp(-88.0, -8.0);
+                if !skin_hot && eval.skin_med < target_skin + 0.025 {
+                    exp = (exp + 0.10).clamp(-1.20, 0.56);
                 }
             }
 
@@ -7046,10 +8261,11 @@ fn inspect_propose_verify_and_refine_photo(
             if headroom > 0.015 && eval.skin_med < target_skin - 0.035 {
                 let need = (target_skin - eval.skin_med).min(headroom * 0.90);
                 let step = if pass == 1 { 0.90 } else { 0.70 };
-                exp = (exp + (need * step).clamp(0.0, 0.22)).clamp(-1.20, 0.56);
+                exp = (exp + (need * step).clamp(0.0, 0.22)).clamp(-1.20, 0.58);
+                shadows = (shadows + 8.0).clamp(16.0, 56.0);
             } else if eval.skin_med < target_skin - 0.045 {
-                shadows = (shadows + 7.0).clamp(16.0, 44.0);
-                orange_lum = (orange_lum + 2.5).clamp(2.0, 15.0);
+                shadows = (shadows + 10.0).clamp(16.0, 56.0);
+                orange_lum = (orange_lum + 2.5).clamp(-4.0, 15.0);
             }
         }
 
@@ -7060,18 +8276,24 @@ fn inspect_propose_verify_and_refine_photo(
             contrast = contrast.clamp(16.0, 22.0);
         } else {
             if eval.p20 < 0.150 || is_backlit {
-                shadows = (shadows + 5.0).clamp(20.0, 44.0);
+                shadows = (shadows + 7.0).clamp(20.0, 56.0);
             }
             if eval.p05 > 0.072 {
-                blacks = (blacks - 3.5).clamp(-22.0, -10.0);
-                contrast = (contrast + 1.5).clamp(10.0, 20.0);
+                blacks = (blacks - 5.0).clamp(-24.0, -10.0);
+                contrast = (contrast + 2.0).clamp(10.0, 22.0);
             }
         }
 
         // Refinamiento en bucle cerrado de Balance de Blancos (WB Temp & Tint)
-        let nw_hi = if eval.is_night_flash { 0.120 } else { 0.072 };
+        let nw_hi = if eval.is_night_flash {
+            0.120
+        } else if style == "reference" {
+            0.110
+        } else {
+            0.072
+        };
         if eval.neutral_warmth < -0.038 {
-            wb_temp = (wb_temp + 180.0).clamp((base_wb_temp - max_wb_shift).max(3800.0), (base_wb_temp + max_wb_shift).min(8200.0));
+            wb_temp = (wb_temp + 240.0).clamp((base_wb_temp - max_wb_shift).max(3800.0), (base_wb_temp + max_wb_shift).min(8200.0));
         } else if eval.neutral_warmth > nw_hi {
             wb_temp = (wb_temp - 180.0).clamp((base_wb_temp - max_wb_shift).max(3800.0), (base_wb_temp + max_wb_shift).min(8200.0));
         }
@@ -7083,10 +8305,12 @@ fn inspect_propose_verify_and_refine_photo(
 
         // Refinamiento estricto de Saturación / Tono Naranja-Rojizo de Piel
         if eval.skin_sat_med > 0.43 || eval.skin_warmth_med > 0.25 {
-            orange_sat = (orange_sat - 3.5).clamp(-20.0, 0.0);
-            red_sat = (red_sat - 3.0).clamp(-16.0, 0.0);
-            orange_lum = (orange_lum + 2.0).clamp(2.0, 16.0);
-            wb_temp = (wb_temp - 140.0).clamp(4200.0, 8200.0);
+            orange_sat = (orange_sat - 4.5).clamp(-22.0, 0.0);
+            red_sat = (red_sat - 3.5).clamp(-18.0, 0.0);
+            if !skin_hot {
+                orange_lum = (orange_lum + 2.0).clamp(-4.0, 16.0);
+            }
+            wb_temp = (wb_temp - 180.0).clamp(4200.0, 8200.0);
         }
     }
 
@@ -7257,7 +8481,7 @@ fn resolve_agent_target_ids(app: &mut LightcraftApp, target: &str, album_name: &
             let kids = app.session.catalog.album_children_by_parent();
             for list in kids.values() {
                 for alb in list {
-                    if !alb.folder && (q.is_empty() || alb.name.to_ascii_lowercase().contains(&q)) {
+                    if !alb.folder && !q.is_empty() && alb.name.to_ascii_lowercase() == q {
                         found_album_id = Some(alb.id);
                         break;
                     }
@@ -7266,9 +8490,31 @@ fn resolve_agent_target_ids(app: &mut LightcraftApp, target: &str, album_name: &
                     break;
                 }
             }
+            if found_album_id.is_none() {
+                for list in kids.values() {
+                    for alb in list {
+                        if !alb.folder && (q.is_empty() || alb.name.to_ascii_lowercase().contains(&q)) {
+                            found_album_id = Some(alb.id);
+                            break;
+                        }
+                    }
+                    if found_album_id.is_some() {
+                        break;
+                    }
+                }
+            }
             if let Some(aid) = found_album_id {
                 let _ = app.run("library.source", json!({"kind": "album", "id": aid.0}));
-                app.session.visible_cloned().into_iter().map(|id| id.0).collect()
+                let vis: Vec<u64> = app.session.visible_cloned().into_iter().map(|id| id.0).collect();
+                if !vis.is_empty() {
+                    vis
+                } else {
+                    app.session
+                        .catalog
+                        .album(aid)
+                        .map(|a| a.photos.iter().map(|p| p.0).collect())
+                        .unwrap_or_default()
+                }
             } else {
                 app.session.visible_cloned().into_iter().map(|id| id.0).collect()
             }
@@ -7294,9 +8540,12 @@ fn inspect_target_photos_only(
     let preview_dir = agent_bridge_dir().join("previews");
     let _ = std::fs::create_dir_all(&preview_dir);
     let mut reports = Vec::new();
+    let total_n = target_ids.len();
+    let sample_step = if total_n <= 12 { 1 } else { (total_n / 10).max(1) };
 
-    for &pid in &target_ids {
+    for (idx, &pid) in target_ids.iter().enumerate() {
         let p_id = lightcraft_catalog::PhotoId(pid);
+        let is_sample = total_n <= 12 || idx == 0 || idx + 1 == total_n || idx % sample_step == 0;
         let fname = app
             .session
             .catalog
@@ -7304,24 +8553,29 @@ fn inspect_target_photos_only(
             .map(|p| p.file_name.clone())
             .unwrap_or_else(|| format!("photo_{pid}"));
         let mut cur_d = app.session.develop_of(p_id).map(|a| (*a).clone()).unwrap_or_default();
-        let info = app.session.source_info(p_id);
-        lightcraft_pipeline::local::normalize_wb(&mut cur_d, &info);
-        if let Ok(src) = app.session.source_now(p_id, lightcraft_engine::SourceLevel::Thumb) {
+        let raw_info = app.session.source_info(p_id);
+        lightcraft_pipeline::local::normalize_wb(&mut cur_d, &raw_info);
+        let (wb_t, wb_ti) = lightcraft_pipeline::local::effective_wb(&raw_info, &cur_d);
+        cur_d.wb.temp = wb_t;
+        cur_d.wb.tint = wb_ti;
+        if let Ok((src, info)) = load_fast_analysis_source(app, p_id, &raw_info, is_sample) {
             let eval = evaluate_rendered_photo(&src, &info, &cur_d, style);
             let before_path = preview_dir.join(format!("{fname}_before.jpg"));
-            let rendered = lightcraft_pipeline::render(
-                &src,
-                &info,
-                &cur_d,
-                &lightcraft_pipeline::RenderRequest::fit(720, 720),
-            );
-            if let Ok(jpeg_bytes) = lightcraft_codecs::encode_jpeg(
-                &lightcraft_codecs::EncodeImage::rgba8(&rendered.image),
-                85,
-                lightcraft_codecs::ChromaSubsampling::S420,
-                &lightcraft_codecs::EncodeMeta::default(),
-            ) {
-                let _ = std::fs::write(&before_path, jpeg_bytes);
+            if is_sample {
+                let rendered = lightcraft_pipeline::render(
+                    &src,
+                    &info,
+                    &cur_d,
+                    &lightcraft_pipeline::RenderRequest::fit(720, 720),
+                );
+                if let Ok(jpeg_bytes) = lightcraft_codecs::encode_jpeg(
+                    &lightcraft_codecs::EncodeImage::rgba8(&rendered.image),
+                    85,
+                    lightcraft_codecs::ChromaSubsampling::S420,
+                    &lightcraft_codecs::EncodeMeta::default(),
+                ) {
+                    let _ = std::fs::write(&before_path, jpeg_bytes);
+                }
             }
             reports.push(AiPhotoQaReport {
                 photo_id: pid,
@@ -7443,12 +8697,17 @@ fn execute_agent_batch_edit(
         }
         "reference" => {
             if let Some((ref_map, ref_lut)) = analyze_reference_photo_style(reference_path) {
-                (ref_map, ref_lut, 55.0)
+                (ref_map, ref_lut, 22.0)
             } else {
                 let mut m = serde_json::Map::new();
-                m.insert("light.contrast".into(), json!(14.0));
-                m.insert("color.vibrance".into(), json!(14.0));
-                (m, "lut:sf-kodak-vision3-250d-107", 55.0)
+                m.insert("color.vibrance".into(), json!(12.0));
+                m.insert("color.saturation".into(), json!(-3.0));
+                m.insert("effects.clarity".into(), json!(7.0));
+                m.insert("effects.texture".into(), json!(-4.0));
+                m.insert("mixer.blue.hue".into(), json!(-18.0));
+                m.insert("mixer.aqua.hue".into(), json!(-10.0));
+                m.insert("mixer.aqua.lum".into(), json!(-10.0));
+                (m, "lut:sf-1-warm-breeze-002", 22.0)
             }
         }
         "web" => {
@@ -7487,20 +8746,54 @@ fn execute_agent_batch_edit(
         .data(|d| d.get_temp::<std::collections::HashMap<u64, AiPhotoQaReport>>(qa_map_id))
         .unwrap_or_default();
 
+    let total_n = target_ids.len();
+    let sample_step = if total_n <= 12 { 1 } else { (total_n / 10).max(1) };
+    let active_pid = app.session.active().map(|id| id.0);
+    let max_passes_batch = if total_n <= 24 { 8 } else { 3 };
+
     // PASS A: Inspect, Propose & Closed-Loop Optimize each photo individually across all 8 pillars
     let mut batch_plans: Vec<(u64, AiComprehensivePlan, AiPhotoQaReport)> = Vec::with_capacity(target_ids.len());
-    for &pid in &target_ids {
-        let _ = app.run("library.select", json!({"ids": [pid], "mode": "replace"}));
-        let _ = app.run("develop.reset", json!({}));
+    let mut last_sample_plan: Option<AiComprehensivePlan> = None;
+    for (idx, &pid) in target_ids.iter().enumerate() {
+        let has_cached_before = app
+            .session
+            .catalog
+            .photo(lightcraft_catalog::PhotoId(pid))
+            .map(|p| preview_dir.join(format!("{}_before.jpg", p.file_name)).exists())
+            .unwrap_or(false);
+        let is_sample = total_n <= 12
+            || idx == 0
+            || idx + 1 == total_n
+            || idx % sample_step == 0
+            || active_pid == Some(pid)
+            || has_cached_before;
 
-        let (plan, qa_report) = inspect_propose_verify_and_refine_photo(
+        let (mut plan, mut qa_report) = inspect_propose_verify_and_refine_photo(
             app,
             lightcraft_catalog::PhotoId(pid),
             style,
             prof_id,
             prof_amt,
             &preview_dir,
+            is_sample,
+            if is_sample { 6 } else { max_passes_batch },
         );
+        if is_sample {
+            last_sample_plan = Some(plan.clone());
+        } else if let Some(anchor) = &last_sample_plan {
+            plan.exp = anchor.exp;
+            plan.highlights = anchor.highlights;
+            plan.shadows = anchor.shadows;
+            plan.whites = anchor.whites;
+            plan.blacks = anchor.blacks;
+            plan.scene_cluster = anchor.scene_cluster.clone();
+            qa_report.exposure = anchor.exp;
+            qa_report.highlights = anchor.highlights;
+            qa_report.shadows = anchor.shadows;
+            qa_report.whites = anchor.whites;
+            qa_report.blacks = anchor.blacks;
+            qa_report.scene_cluster = anchor.scene_cluster.clone();
+        }
         batch_plans.push((pid, plan, qa_report));
     }
 
@@ -7509,9 +8802,19 @@ fn execute_agent_batch_edit(
         harmonize_batch_clusters(&mut batch_plans);
     }
 
-    // PASS C: Apply all 8 pillars to each photo, render high-res verification preview & mark Edited
-    for (pid, plan, mut qa_report) in batch_plans {
-        let _ = app.run("library.select", json!({"ids": [pid], "mode": "replace"}));
+    // PASS C: Apply all 8 pillars to each photo in memory, render high-res verification preview for samples & commit in ONE Op::Batch
+    let mut batch_ops: Vec<lightcraft_catalog::Op> = Vec::with_capacity(batch_plans.len() * 4);
+    let now_iso = "2026-10-27T22:55:00".to_string();
+
+    for (idx, (pid, plan, mut qa_report)) in batch_plans.into_iter().enumerate() {
+        let p_id = lightcraft_catalog::PhotoId(pid);
+        let has_cached_before = std::path::Path::new(&qa_report.preview_before).exists();
+        let is_sample = total_n <= 12
+            || idx == 0
+            || idx + 1 == total_n
+            || idx % sample_step == 0
+            || active_pid == Some(pid)
+            || has_cached_before;
 
         let mut photo_values = base_values.clone();
         let insert_if_not_custom = |m: &mut serde_json::Map<String, serde_json::Value>, key: &str, val: serde_json::Value| {
@@ -7576,57 +8879,86 @@ fn execute_agent_batch_edit(
         insert_if_not_custom(&mut photo_values, "optics.defringeGreen", json!(plan.defringe_green));
         insert_if_not_custom(&mut photo_values, "vignette.amount", json!(plan.vignette_amt));
 
-        if !photo_values.is_empty() {
-            let _ = app.run("develop.set", json!({"values": photo_values}));
+        let existing = app.session.develop_of(p_id).map(|a| (*a).clone()).unwrap_or_default();
+        let raw_info = app.session.source_info(p_id);
+        let mut final_d = lightcraft_develop::DevelopSettings {
+            wb: lightcraft_develop::WhiteBalance {
+                mode: lightcraft_develop::WbMode::AsShot,
+                ..existing.wb
+            },
+            orientation: existing.orientation,
+            ..Default::default()
+        };
+        lightcraft_pipeline::local::normalize_wb(&mut final_d, &raw_info);
+        let (as_shot_t, as_shot_ti) = lightcraft_pipeline::local::effective_wb(&raw_info, &final_d);
+        final_d.wb.temp = as_shot_t;
+        final_d.wb.tint = as_shot_ti;
+
+        for (k, v) in &photo_values {
+            if let Some(num) = v.as_f64() {
+                lightcraft_develop::controls::set(&mut final_d, k, num);
+                if k == "wb.temp" || k == "wb.tint" {
+                    final_d.wb.mode = lightcraft_develop::WbMode::Custom;
+                }
+            }
         }
         if !prof_id.is_empty() {
-            let _ = app.run("develop.profile", json!({"id": prof_id, "amount": prof_amt}));
+            final_d.profile.id = prof_id.to_string();
+            final_d.profile.amount = prof_amt as f64;
         }
 
         // 7. Smart Angle & Composition Crop (`crop.set`)
         let final_angle = custom_crop_angle.unwrap_or(plan.crop_angle);
         let final_rect = custom_crop_rect.unwrap_or(plan.crop_rect);
         if plan.crop_changed || custom_crop_rect.is_some() || custom_crop_angle.is_some() {
-            let _ = app.run(
-                "crop.set",
-                json!({
-                    "angle": final_angle,
-                    "rect": final_rect
-                }),
+            let (pw, ph) = app
+                .session
+                .catalog
+                .photo(p_id)
+                .map(|p| {
+                    let (w, h) = (p.width.max(1) as f64, p.height.max(1) as f64);
+                    if final_d.orientation.swaps_axes() { (h, w) } else { (w, h) }
+                })
+                .unwrap_or((3.0, 2.0));
+            final_d.crop.geometry.angle = final_angle;
+            final_d.crop.geometry.rect = lightcraft_geom::Rect::new(
+                final_rect[0],
+                final_rect[1],
+                final_rect[2],
+                final_rect[3],
             );
+            final_d.crop.geometry = final_d.crop.geometry.constrained(pw, ph);
         }
 
-        // Re-verify final applied state on the photo and export the 720px verification JPEG
-        let p_id = lightcraft_catalog::PhotoId(pid);
-        if let (Ok(src), Some(final_d)) = (
-            app.session.source_now(p_id, lightcraft_engine::SourceLevel::Thumb),
-            app.session.develop_of(p_id),
-        ) {
-            let info = app.session.source_info(p_id);
-            let post_eval = evaluate_rendered_photo(&src, &info, &final_d, style);
+        qa_report.exposure = (final_d.light.exposure * 100.0).round() / 100.0;
+        qa_report.contrast = final_d.light.contrast.round();
+        qa_report.highlights = final_d.light.highlights.round();
+        qa_report.shadows = final_d.light.shadows.round();
+        qa_report.whites = final_d.light.whites.round();
+        qa_report.blacks = final_d.light.blacks.round();
+        qa_report.dehaze = final_d.effects.dehaze.round();
+        qa_report.wb_temp = final_d.wb.temp.round();
+        qa_report.wb_tint = (final_d.wb.tint * 10.0).round() / 10.0;
+        qa_report.crop_angle = (final_d.crop.geometry.angle * 100.0).round() / 100.0;
+        qa_report.crop_rect = [
+            (final_d.crop.geometry.rect.x0 * 1000.0).round() / 1000.0,
+            (final_d.crop.geometry.rect.y0 * 1000.0).round() / 1000.0,
+            (final_d.crop.geometry.rect.x1 * 1000.0).round() / 1000.0,
+            (final_d.crop.geometry.rect.y1 * 1000.0).round() / 1000.0,
+        ];
+
+        // Re-verify final applied state on sample photos and export the 720px verification JPEG
+        if is_sample
+            && let Ok((src, eval_info)) = load_fast_analysis_source(app, p_id, &raw_info, true)
+        {
+            let post_eval = evaluate_rendered_photo(&src, &eval_info, &final_d, style);
             qa_report.final_score = post_eval.score;
             qa_report.final_issues = post_eval.issues;
             qa_report.approved = post_eval.approved;
-            qa_report.exposure = (final_d.light.exposure * 100.0).round() / 100.0;
-            qa_report.contrast = final_d.light.contrast.round();
-            qa_report.highlights = final_d.light.highlights.round();
-            qa_report.shadows = final_d.light.shadows.round();
-            qa_report.whites = final_d.light.whites.round();
-            qa_report.blacks = final_d.light.blacks.round();
-            qa_report.dehaze = final_d.effects.dehaze.round();
-            qa_report.wb_temp = final_d.wb.temp.round();
-            qa_report.wb_tint = (final_d.wb.tint * 10.0).round() / 10.0;
-            qa_report.crop_angle = (final_d.crop.geometry.angle * 100.0).round() / 100.0;
-            qa_report.crop_rect = [
-                (final_d.crop.geometry.rect.x0 * 1000.0).round() / 1000.0,
-                (final_d.crop.geometry.rect.y0 * 1000.0).round() / 1000.0,
-                (final_d.crop.geometry.rect.x1 * 1000.0).round() / 1000.0,
-                (final_d.crop.geometry.rect.y1 * 1000.0).round() / 1000.0,
-            ];
 
             let rendered = lightcraft_pipeline::render(
                 &src,
-                &info,
+                &eval_info,
                 &final_d,
                 &lightcraft_pipeline::RenderRequest::fit(720, 720),
             );
@@ -7640,25 +8972,58 @@ fn execute_agent_batch_edit(
             }
         }
 
+        // Queue develop settings op + Pick/Label/Version in the single batch
+        if let Some(dev_op) = app.session.develop_op(p_id, final_d.clone(), "Edición IA") {
+            batch_ops.push(dev_op);
+        }
+
         // =====================================================================
         // FASE 4: SI LA IA DECIDE QUE SÍ SE VE BIEN, LA MARCA COMO EDITADA
         // =====================================================================
         if mark_when_approved && qa_report.approved {
             qa_report.marked_edited = true;
-            let _ = app.run("photo.pick", json!({"ids": [pid]}));
-            let _ = app.run("photo.label", json!({"ids": [pid], "label": "green"}));
-            let ver_name = format!(
-                "✅ Editada IA ({}% · {} pasadas)",
-                qa_report.final_score, qa_report.passes
-            );
-            let _ = app.run("version.create", json!({"name": ver_name}));
+            batch_ops.push(lightcraft_catalog::Op::SetFlag {
+                id: p_id,
+                flag: lightcraft_catalog::Flag::Pick,
+            });
+            batch_ops.push(lightcraft_catalog::Op::SetLabel {
+                id: p_id,
+                label: Some(lightcraft_catalog::ColorLabel::Green),
+            });
+            if let Some(ph) = app.session.catalog.photo(p_id) {
+                let mut versions = ph.versions.clone();
+                let ver_name = format!(
+                    "✅ Editada IA ({}% · {} pasadas)",
+                    qa_report.final_score, qa_report.passes
+                );
+                versions.push(lightcraft_catalog::Version {
+                    name: ver_name,
+                    created: now_iso.clone(),
+                    settings: std::sync::Arc::new(final_d),
+                    auto: false,
+                });
+                batch_ops.push(lightcraft_catalog::Op::SetVersions {
+                    id: p_id,
+                    versions,
+                });
+            }
         } else {
             qa_report.marked_edited = false;
-            let _ = app.run("photo.label", json!({"ids": [pid], "label": "yellow"}));
+            batch_ops.push(lightcraft_catalog::Op::SetLabel {
+                id: p_id,
+                label: Some(lightcraft_catalog::ColorLabel::Yellow),
+            });
         }
 
         stored_map.insert(pid, qa_report.clone());
         qa_reports.push(qa_report);
+    }
+
+    if !batch_ops.is_empty() {
+        let _ = app
+            .session
+            .commit("Edición IA por Lotes", lightcraft_catalog::Op::Batch { ops: batch_ops });
+        let _ = app.session.persist();
     }
 
     ctx.data_mut(|d| d.insert_temp(qa_map_id, stored_map));

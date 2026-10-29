@@ -28,6 +28,7 @@ pub enum Section {
     Calibration,
     PointColor,
     RedEye,
+    Overlay,
 }
 
 impl Section {
@@ -49,6 +50,7 @@ impl Section {
             Section::Calibration => "Calibration",
             Section::PointColor => "Point Color",
             Section::RedEye => "Red Eye",
+            Section::Overlay => "Overlays",
         }
     }
 }
@@ -290,6 +292,24 @@ controls! {
     "calibration.blueHue" => calibration.blue_hue, "Blue Hue", Calibration, -100, 100, 0, 1, 0, Gradient { from: "#30a0d0", to: "#8040d0" };
     "calibration.blueSat" => calibration.blue_sat, "Blue Saturation", Calibration, -100, 100, 0, 1, 0, Gradient { from: "#7a7a7a", to: "#3a60e0" };
     "crop.angle" => crop.geometry.angle, "Straighten", Geometry, -45, 45, 0, 0.01, 2, Centered;
+    "overlay.preset" => overlay.preset, "Overlay", Overlay, 0, 150, 0, 1, 0, Plain;
+    "overlay.amount" => overlay.amount, "Intensidad", Overlay, 0, 100, 65, 1, 0, Plain;
+    "overlay.blend" => overlay.blend, "Fusión", Overlay, 0, 3, 0, 1, 0, Plain;
+    "overlay.posX" => overlay.pos_x, "Posición X", Overlay, -100, 100, 0, 1, 0, Centered;
+    "overlay.posY" => overlay.pos_y, "Posición Y", Overlay, -100, 100, 0, 1, 0, Centered;
+    "overlay.scale" => overlay.scale, "Tamaño", Overlay, 30, 250, 100, 1, 0, Plain;
+    "overlay.rotation" => overlay.rotation, "Rotación", Overlay, -180, 180, 0, 1, 0, Centered;
+    "overlay.warmth" => overlay.warmth, "Calidez / Tono", Overlay, -100, 100, 0, 1, 0, Temp;
+    "overlay.blur" => overlay.blur, "Suavizado", Overlay, 0, 100, 0, 1, 0, Plain;
+    "overlay.protectCenter" => overlay.protect_center, "Proteger Sujeto", Overlay, 0, 100, 25, 1, 0, Plain;
+    "overlay.flipX" => overlay.flip_x, "Espejo H", Overlay, 0, 1, 0, 1, 0, Plain;
+    "overlay.flipY" => overlay.flip_y, "Espejo V", Overlay, 0, 1, 0, 1, 0, Plain;
+    "overlay.expandAll" => overlay.expand_all, "Ampliar 4 Bordes (%)", Overlay, 0, 35, 0, 1, 0, Plain;
+    "overlay.expandTop" => overlay.expand_top, "Ampliar Arriba (%)", Overlay, 0, 35, 0, 1, 0, Plain;
+    "overlay.expandBottom" => overlay.expand_bottom, "Ampliar Abajo (%)", Overlay, 0, 35, 0, 1, 0, Plain;
+    "overlay.expandLeft" => overlay.expand_left, "Ampliar Izquierda (%)", Overlay, 0, 35, 0, 1, 0, Plain;
+    "overlay.expandRight" => overlay.expand_right, "Ampliar Derecha (%)", Overlay, 0, 35, 0, 1, 0, Plain;
+    "overlay.fillBorders" => overlay.fill_borders, "Rellenar Esquinas", Overlay, 0, 1, 0, 1, 0, Plain;
 }
 
 /// Template specs of the indexed controls (`<family>.<field>`; addressed as `<family>.<i>.<field>`).

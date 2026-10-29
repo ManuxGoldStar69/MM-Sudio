@@ -71,14 +71,16 @@ def analyze_web_portfolio(url: str) -> dict:
     }
 
 
-def dispatch_and_wait(payload: dict, timeout_s: float = 45.0):
+def dispatch_and_wait(payload: dict, timeout_s: float = 120.0):
     if RES_FILE.exists():
         try:
             RES_FILE.unlink()
         except OSError:
             pass
 
-    CMD_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    tmp_cmd = BRIDGE_DIR / f"command.{payload.get('cmd_id', 'tmp')}.tmp"
+    tmp_cmd.write_text(json.dumps(payload), encoding="utf-8")
+    tmp_cmd.replace(CMD_FILE)
     steps = int(timeout_s / 0.1)
     for _ in range(steps):
         if RES_FILE.exists():

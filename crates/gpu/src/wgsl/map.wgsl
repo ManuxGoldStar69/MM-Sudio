@@ -226,3 +226,29 @@ fn redeye_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups
     }
     put_rgb(i, c);
 }
+
+// Frequency-Separated Laplacian Pyramid + Statistical LAB Color Transfer healing kernel:
+// `a`: source RGB patch, `b`: low-pass source in LAB, `c`: target low-pass illumination in LAB.
+// P[1..4] = target boundary LAB mean (mu_t), P[4..7] = source LAB mean (mu_s),
+// P[7..10] = clamped LAB standard-deviation ratio (sigma_t / sigma_s).
+@compute @workgroup_size(256)
+fn heal_freq_sep_k(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let i = lin_index(g, nw);
+    if (i >= pu(0u)) {
+        return;
+    }
+    let s_lab = oklab(max(rgb_a(i), vec3<f32>(0.0)));
+    let mu_t = vec3<f32>(pf(1u), pf(2u), pf(3u));
+    let mu_s = vec3<f32>(pf(4u), pf(5u), pf(6u));
+    let gain = vec3<f32>(pf(7u), pf(8u), pf(9u));
+    let s_adapt = vec3<f32>(
+        max(mu_t.x + (s_lab.x - mu_s.x) * gain.x, 0.0),
+        mu_t.y + (s_lab.y - mu_s.y) * gain.y,
+        mu_t.z + (s_lab.z - mu_s.z) * gain.z,
+    );
+    let s_low = vec3<f32>(b[3u * i], b[3u * i + 1u], b[3u * i + 2u]);
+    let t_low = vec3<f32>(c[3u * i], c[3u * i + 1u], c[3u * i + 2u]);
+    let high_pass = s_adapt - s_low;
+    let healed_lab = vec3<f32>(max(t_low.x + high_pass.x, 0.0), t_low.y + high_pass.y, t_low.z + high_pass.z);
+    put_rgb(i, max(oklab_inv(healed_lab), vec3<f32>(0.0)));
+}

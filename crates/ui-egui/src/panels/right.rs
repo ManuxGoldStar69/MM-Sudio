@@ -408,6 +408,59 @@ fn crop(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {
         let out = slider(ui, spec, v, true, None);
         super::edit::apply_slider_out(app, spec, out, |app, v| app.run("develop.set", json!({"control": spec.id, "value": v})));
     }
+    divider(ui);
+    header(ui, "Generación Expansiva IA (LaMa)");
+    padded(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (lbl, val) in [("Original (0%)", 0.0), ("⤢ +10%", 10.0), ("⤢ +20%", 20.0), ("⤢ +30%", 30.0)] {
+                let active = if val == 0.0 {
+                    !d.overlay.has_outpaint()
+                } else {
+                    (d.overlay.expand_all - val).abs() < 1.0
+                };
+                if text_button(ui, &format!("cropOutpaintPreset-{val}"), lbl, active).clicked() {
+                    if val == 0.0 {
+                        let _ = app.run(
+                            "develop.set",
+                            json!({
+                                "values": {
+                                    "overlay.expandAll": 0.0,
+                                    "overlay.expandTop": 0.0,
+                                    "overlay.expandBottom": 0.0,
+                                    "overlay.expandLeft": 0.0,
+                                    "overlay.expandRight": 0.0,
+                                    "overlay.fillBorders": 0.0
+                                }
+                            }),
+                        );
+                    } else {
+                        let _ = app.run("develop.set", json!({"control": "overlay.expandAll", "value": val}));
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
+        let mut fb = d.overlay.fill_borders > 0.5;
+        if ui.checkbox(&mut fb, "Rellenar esquinas con IA al rotar (Outpaint)").changed() {
+            let _ = app.run(
+                "develop.set",
+                json!({"control": "overlay.fillBorders", "value": if fb { 1.0 } else { 0.0 }}),
+            );
+        }
+    });
+    for ctrl_id in [
+        "overlay.expandAll",
+        "overlay.expandTop",
+        "overlay.expandBottom",
+        "overlay.expandLeft",
+        "overlay.expandRight",
+    ] {
+        if let Some(spec) = lightcraft_develop::controls::find(ctrl_id) {
+            let v = lightcraft_develop::controls::get(&d, spec.id).unwrap_or(spec.default);
+            let out = slider(ui, spec, v, true, None);
+            super::edit::apply_slider_out(app, spec, out, |app, v| app.run("develop.set", json!({"control": spec.id, "value": v})));
+        }
+    }
 }
 
 fn remove(app: &mut LightcraftApp, ui: &mut egui::Ui, id: PhotoId) {

@@ -1653,6 +1653,60 @@ fn general_interaction(
             return;
         }
     }
+    let overlay_drag = ui
+        .ctx()
+        .data(|dd| dd.get_temp::<bool>(egui::Id::new("studio-overlay-drag-active")))
+        .unwrap_or(false);
+    if overlay_drag && app.ui.tool.is_empty() && d.overlay.is_active() {
+        let t = Tokens::get(ui.ctx());
+        let banner_w = 430.0_f32.min(canvas.width() - 24.0);
+        let banner_r = Rect::from_center_size(
+            pos2(canvas.center().x, canvas.top() + 24.0),
+            vec2(banner_w, 28.0),
+        );
+        ui.painter().rect(
+            banner_r,
+            egui::CornerRadius::same(14),
+            Color32::from_rgba_unmultiplied(24, 24, 28, 225),
+            Stroke::new(1.0, Color32::from_rgb(245, 198, 112)),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            banner_r.center(),
+            Align2::CENTER_CENTER,
+            "🖐 Arrastra el Overlay · Alt+Rueda: Tamaño · Doble clic: Centrar",
+            t.semibold(10.8),
+            Color32::from_rgb(252, 225, 165),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            let scroll_y = ui.input(|i| if i.modifiers.alt { i.smooth_scroll_delta.y } else { 0.0 });
+            if scroll_y.abs() > 0.5 {
+                let ns = (d.overlay.scale + scroll_y as f64 * 0.45).clamp(30.0, 250.0);
+                let _ = app.run("develop.set", json!({"control": "overlay.scale", "value": ns}));
+            }
+        }
+        if resp.double_clicked() {
+            let _ = app.run("develop.set", json!({"values": {"overlay.posX": 0.0, "overlay.posY": 0.0}}));
+            return;
+        }
+        if resp.drag_started() {
+            let _ = app.session.begin_interaction("Move Overlay");
+        }
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let delta = resp.drag_delta();
+            let step_x = 200.0 / (img.width().max(1.0) as f64);
+            let step_y = 200.0 / (img.height().max(1.0) as f64);
+            let nx = (d.overlay.pos_x + delta.x as f64 * step_x).clamp(-100.0, 100.0);
+            let ny = (d.overlay.pos_y + delta.y as f64 * step_y).clamp(-100.0, 100.0);
+            let _ = app.run("develop.set", json!({"values": {"overlay.posX": nx, "overlay.posY": ny}}));
+        }
+        if resp.drag_stopped() {
+            let _ = app.session.end_interaction();
+        }
+        return;
+    }
     let magic_drag = ui
         .ctx()
         .data(|dd| dd.get_temp::<bool>(egui::Id::new("studio-magic-drag-mask")))

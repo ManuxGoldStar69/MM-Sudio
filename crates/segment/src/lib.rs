@@ -230,26 +230,86 @@ impl Sam3 {
     /// `threshold` (0..1, 0.5 is the reference default) are merged into one mask; `None` when
     /// nothing matches.
     pub fn segment_text(&mut self, enc: &mut Encoded, text: &str, threshold: f32) -> Result<Option<Prediction>> {
+        let normalized = normalize_concept_prompt(text);
         let (det, tok) = self.detector_parts()?;
         if enc.detector.is_none() {
             enc.detector = Some(det.features(&enc.backbone)?);
         }
         let f = enc.detector.as_ref().ok_or_else(|| Error::Model("detector features".into()))?;
-        let (ids, valid) = tok.encode(text);
+        let (ids, valid) = tok.encode(&normalized);
         let out = det.predict(f, &ids, &valid)?;
-        Ok(detector::merge(&out, threshold))
+        if let Some(pred) = detector::merge(&out, threshold) {
+            return Ok(Some(pred));
+        }
+        // Adaptive lower threshold retry if the user typed a fine-grained concept
+        if threshold > 0.32 {
+            return Ok(detector::merge(&out, 0.32));
+        }
+        Ok(None)
     }
 
     /// Raw detector outputs for `text` (tests and tools).
     pub fn detect(&mut self, enc: &mut Encoded, text: &str) -> Result<detector::Output> {
+        let normalized = normalize_concept_prompt(text);
         let (det, tok) = self.detector_parts()?;
         if enc.detector.is_none() {
             enc.detector = Some(det.features(&enc.backbone)?);
         }
         let f = enc.detector.as_ref().ok_or_else(|| Error::Model("detector features".into()))?;
-        let (ids, valid) = tok.encode(text);
+        let (ids, valid) = tok.encode(&normalized);
         det.predict(f, &ids, &valid)
     }
+}
+
+/// Maps common Spanish & photography terms to canonical English CLIP/SAM-3 object concepts
+/// so users can type natural Spanish or English queries in Magic Masks.
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize_concept_prompt(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_lowercase();
+    let mapped = match lower.as_str() {
+        "persona" | "personas" | "gente" | "sujeto" | "invitados" => "person",
+        "novia" => "bride woman in wedding dress",
+        "novio" => "groom man in suit",
+        "pareja" | "novios" => "couple bride and groom",
+        "rostro" | "rostros" | "cara" | "caras" => "face",
+        "piel" => "human skin",
+        "cabello" | "pelo" | "peinado" => "hair",
+        "ojos" | "ojo" => "eyes",
+        "labios" | "boca" => "lips",
+        "vestido" | "vestido de novia" => "dress wedding gown",
+        "traje" | "saco" | "smoking" => "suit jacket",
+        "ropa" | "atuendo" | "vestimenta" => "clothing outfit",
+        "ramo" | "ramo de flores" | "bouquet" => "flower bouquet",
+        "flores" | "flor" | "arreglo floral" => "flowers",
+        "anillo" | "anillos" | "argollas" => "ring jewelry",
+        "velo" => "bridal veil",
+        "zapatos" | "tacones" | "calzado" => "shoes",
+        "cielo" | "nubes" => "sky clouds",
+        "agua" | "mar" | "oceano" | "océano" | "lago" | "alberca" | "piscina" => "water",
+        "arbol" | "árbol" | "arboles" | "árboles" | "vegetacion" | "vegetación" | "hojas" | "follaje" | "plantas" => "trees foliage plants",
+        "pasto" | "cesped" | "césped" | "hierba" => "grass lawn",
+        "montaña" | "montañas" | "cerro" => "mountain",
+        "edificio" | "edificios" | "arquitectura" | "iglesia" | "pared" | "muro" => "building architecture",
+        "suelo" | "piso" | "camino" | "calle" | "tierra" => "ground floor road",
+        "coche" | "carro" | "auto" | "automovil" | "automóvil" | "vehiculo" => "car vehicle",
+        "perro" | "mascota" | "cachorro" => "dog",
+        "gato" => "cat",
+        "mesa" | "centro de mesa" | "banquete" => "table",
+        "silla" | "sillas" => "chair",
+        "pastel" | "tarta" | "postre" => "wedding cake",
+        "copa" | "copas" | "vaso" | "botella" | "vino" => "wine glass bottle",
+        "luces" | "focos" | "lampara" | "lámpara" | "velas" | "candelabro" => "lights chandelier candles",
+        "letrero" | "cartel" | "señal" => "sign",
+        "cable" | "cables" | "poste" => "wire cable pole",
+        "basura" | "bote de basura" => "trash bin",
+        "fondo" => "background",
+        _ => return trimmed.to_string(),
+    };
+    mapped.to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

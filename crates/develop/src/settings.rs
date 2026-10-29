@@ -139,6 +139,10 @@ pub struct DevelopSettings {
     pub enhance: Enhance,
     /// Camera calibration: shadows tint and primary hue/saturation (applied before tone mapping).
     pub calibration: Calibration,
+    /// Creative optical overlay (Light Leaks, Bokeh, Sunbeams, Prism/Halation, Anamorphic/Weather).
+    /// Omitted when at default (`preset == 0`) so existing settings JSON and hashes stay identical.
+    #[serde(default, skip_serializing_if = "CreativeOverlay::is_default")]
+    pub overlay: CreativeOverlay,
     /// Section on/off toggles (the "eye" buttons on panel headers): section id → enabled.
     pub disabled_sections: Vec<String>,
 }
@@ -173,6 +177,7 @@ impl Default for DevelopSettings {
             lens_blur: LensBlur::default(),
             enhance: Enhance::default(),
             calibration: Calibration::default(),
+            overlay: CreativeOverlay::default(),
             disabled_sections: Vec::new(),
         }
     }
@@ -607,6 +612,98 @@ pub struct Grain {
 impl Default for Grain {
     fn default() -> Self {
         Self { amount: 0.0, size: 25.0, roughness: 50.0, seed: 0 }
+    }
+}
+
+/// High-resolution optical & atmospheric overlay (5 categories × 30 presets = 150 overlays).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CreativeOverlay {
+    /// Preset index: 0 = None, 1..=150 = active overlay card.
+    pub preset: f64,
+    /// Opacity / strength (0..100, default 65).
+    pub amount: f64,
+    /// Blend mode: 0 = Screen, 1 = Soft Light, 2 = Linear Dodge (Add), 3 = Overlay.
+    pub blend: f64,
+    /// Horizontal offset (-100..100, default 0).
+    pub pos_x: f64,
+    /// Vertical offset (-100..100, default 0).
+    pub pos_y: f64,
+    /// Scale percentage (30..250, default 100).
+    pub scale: f64,
+    /// Rotation angle in degrees (-180..180, default 0).
+    pub rotation: f64,
+    /// Color warmth / hue shift (-100..100, default 0).
+    pub warmth: f64,
+    /// Optical softness / defocus (0..100, default 0).
+    pub blur: f64,
+    /// Center / subject protection (0..100, default 25).
+    pub protect_center: f64,
+    /// Horizontal mirror (0 = off, 1 = on).
+    pub flip_x: f64,
+    /// Vertical mirror (0 = off, 1 = on).
+    pub flip_y: f64,
+    /// Generative border expansion (Outpainting via LaMa ONNX): uniform expansion % (0..35).
+    #[serde(default)]
+    pub expand_all: f64,
+    /// Generative top border expansion % (0..35).
+    #[serde(default)]
+    pub expand_top: f64,
+    /// Generative bottom border expansion % (0..35).
+    #[serde(default)]
+    pub expand_bottom: f64,
+    /// Generative left border expansion % (0..35).
+    #[serde(default)]
+    pub expand_left: f64,
+    /// Generative right border expansion % (0..35).
+    #[serde(default)]
+    pub expand_right: f64,
+    /// Automatically fill empty rotation/perspective corners with LaMa Outpainting (0 = off, 1 = on).
+    #[serde(default)]
+    pub fill_borders: f64,
+}
+
+impl Default for CreativeOverlay {
+    fn default() -> Self {
+        Self {
+            preset: 0.0,
+            amount: 65.0,
+            blend: 0.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            scale: 100.0,
+            rotation: 0.0,
+            warmth: 0.0,
+            blur: 0.0,
+            protect_center: 25.0,
+            flip_x: 0.0,
+            flip_y: 0.0,
+            expand_all: 0.0,
+            expand_top: 0.0,
+            expand_bottom: 0.0,
+            expand_left: 0.0,
+            expand_right: 0.0,
+            fill_borders: 0.0,
+        }
+    }
+}
+
+impl CreativeOverlay {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.preset.round() >= 1.0 && self.amount > 0.0
+    }
+
+    pub fn has_outpaint(&self) -> bool {
+        self.expand_all > 0.1
+            || self.expand_top > 0.1
+            || self.expand_bottom > 0.1
+            || self.expand_left > 0.1
+            || self.expand_right > 0.1
+            || self.fill_borders >= 0.5
     }
 }
 
