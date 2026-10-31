@@ -165,12 +165,102 @@ pub fn start_print(app: &mut LightcraftApp, params: &Value) -> Result<Value, Str
                 if c.load(Ordering::Relaxed) {
                     return Err("Print cancelled".into());
                 }
-                let bytes = output::write(&pages, &settings.job, &title)?;
-                guard.check(std::path::Path::new(&path))?;
-                match write {
-                    Some(write) => write(&path, &bytes)?,
-                    None => lightcraft_engine::export::write_file(&path, &bytes)?,
+                let write_bytes = |target: &str, data: &[u8]| -> Result<(), String> {
+                    guard.check(std::path::Path::new(target))?;
+                    match &write {
+                        Some(w) => w(target, data),
+                        None => lightcraft_engine::export::write_file(target, data),
+                    }
+                };
+                if settings.book.enabled {
+                    use lightcraft_engine::print::book::{
+                        BindingMode, compose_saddle_stitch_sheets, encode_page_jpeg_srgb, split_spreads_to_single_pages,
+                    };
+                    match settings.book.binding_mode {
+                        BindingMode::LayflatSpreads => {
+                            let target_path = std::path::Path::new(&path);
+                            let out_dir = if target_path.extension().is_some_and(|ext| {
+                                ext.eq_ignore_ascii_case("pdf") || ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg")
+                            }) {
+                                target_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf()
+                            } else {
+                                target_path.to_path_buf()
+                            };
+                            let _ = std::fs::create_dir_all(&out_dir);
+                            let mut total_bytes = 0usize;
+                            for (idx, sp) in pages.iter().enumerate() {
+                                let fpath = out_dir.join(format!("Pliego_{:02}.jpg", idx + 1));
+                                let fstr = fpath.to_string_lossy().to_string();
+                                let jpg = encode_page_jpeg_srgb(sp, 96)?;
+                                total_bytes += jpg.len();
+                                write_bytes(&fstr, &jpg)?;
+                            }
+                            if settings.book.hardcover_wrap
+                                && let Some(first_sp) = pages.first()
+                            {
+                                let cpath = out_dir.join("Portada.jpg");
+                                let cstr = cpath.to_string_lossy().to_string();
+                                let jpg = encode_page_jpeg_srgb(first_sp, 96)?;
+                                total_bytes += jpg.len();
+                                write_bytes(&cstr, &jpg)?;
+                            }
+                            if target_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf")) {
+                                let pdf_bytes = output::write(&pages, &settings.job, &title)?;
+                                total_bytes += pdf_bytes.len();
+                                write_bytes(&path, &pdf_bytes)?;
+                            }
+                            return Ok(vec![json!({
+                                "path": path,
+                                "pages": pages.len(),
+                                "photos": photos,
+                                "bytes": total_bytes,
+                                "print": true,
+                                "mode": "layflatSpreads"
+                            })]);
+                        }
+                        BindingMode::SequentialPdf => {
+                            let singles = split_spreads_to_single_pages(
+                                &pages,
+                                settings.book.spread_mode,
+                                settings.page.background,
+                                settings.guides.bleed_mm,
+                                settings.guides.gutter_mm,
+                                settings.page.crop_marks,
+                            )?;
+                            let bytes = output::write(&singles, &settings.job, &title)?;
+                            write_bytes(&path, &bytes)?;
+                            return Ok(vec![json!({
+                                "path": path,
+                                "pages": singles.len(),
+                                "photos": photos,
+                                "bytes": bytes.len(),
+                                "print": true,
+                                "mode": "sequentialPdf"
+                            })]);
+                        }
+                        BindingMode::SaddleStitch => {
+                            let (sheets, _plan, _orig) = compose_saddle_stitch_sheets(
+                                &pages,
+                                settings.book.spread_mode,
+                                settings.page.background,
+                                settings.guides.bleed_mm,
+                                settings.page.crop_marks,
+                            )?;
+                            let bytes = output::write(&sheets, &settings.job, &title)?;
+                            write_bytes(&path, &bytes)?;
+                            return Ok(vec![json!({
+                                "path": path,
+                                "pages": sheets.len(),
+                                "photos": photos,
+                                "bytes": bytes.len(),
+                                "print": true,
+                                "mode": "saddleStitch"
+                            })]);
+                        }
+                    }
                 }
+                let bytes = output::write(&pages, &settings.job, &title)?;
+                write_bytes(&path, &bytes)?;
                 Ok(vec![json!({"path": path, "pages": pages.len(), "photos": photos, "bytes": bytes.len(), "print": true})])
             });
         let _ = tx.send(result.map(|files| (files, None, c.load(Ordering::Relaxed))));
@@ -180,6 +270,81 @@ pub fn start_print(app: &mut LightcraftApp, params: &Value) -> Result<Value, Str
     #[cfg(target_arch = "wasm32")]
     work();
     let row = app.session.activity.start("export", "Printing to PDF", Cancel::Flag(cancel.clone()));
+    row.progress(0, total as u64);
+    app.export = Some(ExportTask { total, progress, cancel, rx, guard: row });
+    Ok(json!({"background": true, "total": total}))
+}
+
+/// Package the current Photobook project and all referenced photos (rendered at 300 DPI sRGB) into
+/// a single self-contained `.mmbook` file on a background worker thread so the UI never blocks.
+pub fn start_save_mmbook(app: &mut LightcraftApp, params: &Value) -> Result<Value, String> {
+    if app.export.is_some() {
+        return Err("an export is already running".into());
+    }
+    let raw_path = params.get("path").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).ok_or("missing path")?.to_string();
+    let path = if std::path::Path::new(&raw_path).extension().is_some_and(|e| e.eq_ignore_ascii_case("mmbook")) {
+        raw_path
+    } else {
+        format!("{raw_path}.mmbook")
+    };
+    app.session.check_write_target(&path)?;
+    let guard = app.session.original_guard();
+    let settings = app.session.print.clone();
+    let ids = app.session.targets(params).map_err(|e| e.to_string())?;
+    let title = params
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Proyecto_Fotolibro")
+                .to_string()
+        });
+    let prepared = lightcraft_engine::print::book::prepare_mmbook(&mut app.session, &title, &settings, &ids)?;
+    let total = prepared.len().max(1);
+    let pages = prepared.settings.layout.pages;
+    let photos = prepared.len();
+    let write = app.services.write_shared.clone();
+    let progress = Arc::new(Mutex::new((0, String::new())));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (p, c) = (progress.clone(), cancel.clone());
+    let (tx, rx) = channel();
+    let work = move || {
+        let result = prepared
+            .run(&mut |done, name| {
+                if let Ok(mut g) = p.lock() {
+                    *g = (done, name.to_string());
+                }
+                !c.load(Ordering::Relaxed)
+            })
+            .and_then(|bytes| {
+                if c.load(Ordering::Relaxed) {
+                    return Err("Guardado de proyecto .mmbook cancelado".into());
+                }
+                guard.check(std::path::Path::new(&path))?;
+                match &write {
+                    Some(w) => w(&path, &bytes)?,
+                    None => lightcraft_engine::export::write_file(&path, &bytes)?,
+                }
+                Ok(vec![json!({
+                    "path": path,
+                    "pages": pages,
+                    "photos": photos,
+                    "bytes": bytes.len(),
+                    "mmbook": true,
+                })])
+            });
+        let _ = tx.send(result.map(|files| (files, None, c.load(Ordering::Relaxed))));
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::Builder::new().name("mmbook-save".into()).spawn(work).map_err(|e| e.to_string())?;
+    #[cfg(target_arch = "wasm32")]
+    work();
+    let row = app.session.activity.start("export", "Empaquetando proyecto .mmbook", Cancel::Flag(cancel.clone()));
     row.progress(0, total as u64);
     app.export = Some(ExportTask { total, progress, cancel, rx, guard: row });
     Ok(json!({"background": true, "total": total}))
@@ -255,6 +420,17 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
                     }
                     if let Some(pdf) = files.first().filter(|f| f["print"] == true) {
                         m = format!("Printed to PDF: {} photos, {} pages", pdf["photos"], pdf["pages"]);
+                    }
+                    if let Some(mm) = files.first().filter(|f| f["mmbook"] == true) {
+                        let fname = mm["path"]
+                            .as_str()
+                            .and_then(|p| std::path::Path::new(p).file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Proyecto.mmbook");
+                        m = format!(
+                            "📦 Proyecto de imprenta guardado: {fname} ({} fotos a 300 DPI, {} pliegos)",
+                            mm["photos"], mm["pages"]
+                        );
                     }
                     if skipped > 0 {
                         m += &crate::i18n::tr_format!(" · {skipped} skipped (file exists)", skipped = skipped);

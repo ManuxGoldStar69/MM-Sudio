@@ -255,7 +255,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::Export { .. } => "Export",
         Dialog::ContactSheet { .. } => "Contact Sheet PDF",
         Dialog::SlideshowExport { .. } => "Export Slideshow",
-        Dialog::Print => "Print",
+        Dialog::Print => "Imprimir y Photobook",
         Dialog::Merge { opts } => opts.title(),
         Dialog::Settings { .. } => "Settings",
         Dialog::ConfirmDelete { .. } => "Delete Photos",
@@ -1348,6 +1348,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     Dialog::SamModel { .. } if sam_running || sam_installed || sam_nowhere => "Close",
                     Dialog::SamModel { .. } => "Not Now",
                     Dialog::LightroomResult { .. } => "Close",
+                    Dialog::Print => "Cancelar",
                     _ => "Cancel",
                 };
                 let add_label;
@@ -1361,7 +1362,17 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     Dialog::LightroomResult { first: Some(_), .. } => "Show in Library",
                     Dialog::ContactSheet { .. } => "Choose PDF…",
                     Dialog::SlideshowExport { .. } => "Export…",
-                    Dialog::Print => "Print to PDF…",
+                    Dialog::Print => {
+                        if app.session.print.book.enabled {
+                            match app.session.print.book.binding_mode {
+                                lightcraft_engine::print::book::BindingMode::LayflatSpreads => "Exportar Pliegos Layflat (300 DPI)…",
+                                lightcraft_engine::print::book::BindingMode::SequentialPdf => "Exportar PDF Secuencial (300 DPI)…",
+                                lightcraft_engine::print::book::BindingMode::SaddleStitch => "Exportar Cuadernillo Compaginado (300 DPI)…",
+                            }
+                        } else {
+                            "Imprimir a PDF…"
+                        }
+                    }
                     Dialog::Merge { .. } => "Merge",
                     Dialog::DenoiseModel { info, .. } if info["download"].is_string() => "Accept & Download",
                     Dialog::DenoiseModel { .. } => "Install",

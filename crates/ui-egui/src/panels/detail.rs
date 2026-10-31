@@ -433,7 +433,12 @@ fn request_window(app: &mut LightcraftApp, c: &WindowCtx, v: &WindowView) -> Opt
     // The overlay and the proof are part of the tile's identity too, so changing mask view/colour
     // or the proof never leaves a stale region tile on screen while its replacement renders.
     let proof_key = if v.before { 0 } else { proof.map_or(0, |p| p.key()) };
-    let look = job.settings.hash64() ^ overlay.key().rotate_left(17) ^ proof_key.rotate_left(41);
+    let ai_tag = if job.settings.spots.is_empty() && !job.settings.overlay.has_outpaint() {
+        0
+    } else {
+        lightcraft_pipeline::current_cloud_mode_tag().1
+    };
+    let look = job.settings.hash64() ^ overlay.key().rotate_left(17) ^ proof_key.rotate_left(41) ^ ai_tag.rotate_left(29);
     let view = crate::region::RegionView { photo: c.id, before: v.before, key: job.key, full: (fw, fh), window: win, settings: look };
     // windows of other photos, looks and zooms of this side can't be drawn any more
     app.region_tiles.retain(|(before, _), t| *before != v.before || t.is_current(c.id, (fw, fh), look, c.interacting));
@@ -486,6 +491,9 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let right = if fullscreen {
         RightPanel::None
     } else if studio_eraser_on {
+        if !matches!(app.ui.tool.as_str(), "fill" | "heal" | "clone") {
+            app.ui.tool = "fill".into();
+        }
         RightPanel::Remove
     } else if studio_mask_brush_on {
         app.ui.tool = "brush".into();
@@ -574,7 +582,12 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let native_long = native[0].max(native[1]);
     let drawn_long = target_rect.width().max(target_rect.height()) * ppp;
     // the whole frame at about canvas size; the zoomed part of it is a window render (below)
-    let look = d.hash64();
+    let ai_look_tag = if d.spots.is_empty() && !d.overlay.has_outpaint() {
+        0
+    } else {
+        lightcraft_pipeline::current_cloud_mode_tag().1
+    };
+    let look = d.hash64() ^ ai_look_tag.rotate_left(29);
     // Diagnostic views that need whole-frame context, or reads too far for one window, still
     // render the whole frame at the size it is drawn. Mask overlays and soft proofing (both act
     // pixel by pixel) are window-safe.
@@ -597,7 +610,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         native_long,
         texture_side,
         draft,
-        windows: overlay_supports_window(overlay) && !has_whole_frame_ai_mask,
+        windows: overlay_supports_window(overlay) && !has_whole_frame_ai_mask && crate::region::same_aspect(display_aspect, aspect),
     };
     let mut plan = crate::region::plan(&app.ui.settings, sizes);
     if plan.window_edge.is_some_and(|edge| app.window_refused == Some((id, look, edge))) {
@@ -1652,6 +1665,60 @@ fn general_interaction(
             app.ui.mask_overlay_all = false;
             return;
         }
+    }
+    let sky_drag = ui
+        .ctx()
+        .data(|dd| dd.get_temp::<bool>(egui::Id::new("studio-sky-drag-active")))
+        .unwrap_or(false);
+    if sky_drag && app.ui.tool.is_empty() && d.sky.is_active() {
+        let t = Tokens::get(ui.ctx());
+        let banner_w = 440.0_f32.min(canvas.width() - 24.0);
+        let banner_r = Rect::from_center_size(
+            pos2(canvas.center().x, canvas.top() + 24.0),
+            vec2(banner_w, 28.0),
+        );
+        ui.painter().rect(
+            banner_r,
+            egui::CornerRadius::same(14),
+            Color32::from_rgba_unmultiplied(18, 24, 34, 230),
+            Stroke::new(1.0, Color32::from_rgb(98, 196, 255)),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            banner_r.center(),
+            Align2::CENTER_CENTER,
+            "🌤️ Arrastra el Cielo 4K · Alt+Rueda: Zoom · Doble clic: Centrar",
+            t.semibold(10.8),
+            Color32::from_rgb(175, 228, 255),
+        );
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            let scroll_y = ui.input(|i| if i.modifiers.alt { i.smooth_scroll_delta.y } else { 0.0 });
+            if scroll_y.abs() > 0.5 {
+                let ns = (d.sky.scale + scroll_y as f64 * 0.45).clamp(50.0, 250.0);
+                let _ = app.run("develop.set", json!({"control": "sky.scale", "value": ns}));
+            }
+        }
+        if resp.double_clicked() {
+            let _ = app.run("develop.set", json!({"values": {"sky.posX": 0.0, "sky.posY": 0.0}}));
+            return;
+        }
+        if resp.drag_started() {
+            let _ = app.session.begin_interaction("Move SmartSky");
+        }
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let delta = resp.drag_delta();
+            let step_x = 200.0 / (img.width().max(1.0) as f64);
+            let step_y = 200.0 / (img.height().max(1.0) as f64);
+            let nx = (d.sky.pos_x + delta.x as f64 * step_x).clamp(-100.0, 100.0);
+            let ny = (d.sky.pos_y + delta.y as f64 * step_y).clamp(-100.0, 100.0);
+            let _ = app.run("develop.set", json!({"values": {"sky.posX": nx, "sky.posY": ny}}));
+        }
+        if resp.drag_stopped() {
+            let _ = app.session.end_interaction();
+        }
+        return;
     }
     let overlay_drag = ui
         .ctx()
@@ -2796,6 +2863,11 @@ fn remove_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respo
     // (spot, is source, screen centre, radius) of everything that can be grabbed
     let mut grips: Vec<(usize, bool, Pos2, f32)> = Vec::new();
     for (i, s) in d.spots.iter().enumerate() {
+        let is_ai_fill = s.mode == lightcraft_develop::SpotMode::Fill
+            || (s.mode == lightcraft_develop::SpotMode::Remove && s.points.len() >= 12);
+        if is_ai_fill && mode != ToolOverlay::Always {
+            continue;
+        }
         let r = (s.size * long) as f32;
         let sel = Some(i) == active;
         if !mode.shows(sel, live) {
@@ -2808,7 +2880,7 @@ fn remove_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respo
         }
         let Some(&t) = s.points.first() else { continue };
         let tq = map.screen(t);
-        if let Some(o) = s.source_offset.filter(|_| sel) {
+        if let Some(o) = s.source_offset.filter(|_| sel && !is_ai_fill) {
             let sq = map.screen(Point::new(t.x + o.x, t.y + o.y));
             for q in &s.points {
                 p.circle_stroke(map.screen(Point::new(q.x + o.x, q.y + o.y)), r, Stroke::new(1.0, Color32::from_white_alpha(170)));
@@ -2820,7 +2892,9 @@ fn remove_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respo
         }
         pin(p, tq, sel);
         register(ui.ctx(), format!("spotPin:{i}"), Rect::from_center_size(tq, vec2(14.0, 14.0)));
-        grips.push((i, false, tq, r));
+        if !is_ai_fill {
+            grips.push((i, false, tq, r));
+        }
     }
     if spot_keys(app, ui, map, d, &grips) {
         return;
@@ -2837,7 +2911,7 @@ fn remove_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respo
     let hit = |q: Pos2| {
         grips
             .iter()
-            .filter(|g| g.2.distance(q) < g.3.max(8.0))
+            .filter(|g| g.2.distance(q) < g.3.min(11.0).max(8.0))
             .min_by(|a, b| {
                 (Some(a.0) != active, a.2.distance(q)).partial_cmp(&(Some(b.0) != active, b.2.distance(q))).unwrap_or(std::cmp::Ordering::Equal)
             })
@@ -2889,14 +2963,36 @@ fn remove_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respo
         && (resp.drag_started() || resp.dragged() || resp.clicked())
     {
         let n = map.norm(q);
+        let step = (app.ui.remove_size as f64 * 0.35).max(0.004);
         match &mut app.gesture {
-            Some(Gesture::Spot { points }) => points.push(n),
+            Some(Gesture::Spot { points }) => {
+                if let Some(&last) = points.last() {
+                    let dx = n.x - last.x;
+                    let dy = n.y - last.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist > step {
+                        let segs = ((dist / step).ceil() as usize).min(32);
+                        for k in 1..=segs {
+                            let t = k as f64 / segs as f64;
+                            points.push(Point::new(last.x + dx * t, last.y + dy * t));
+                        }
+                    } else if dist > 0.0015 {
+                        points.push(n);
+                    }
+                } else {
+                    points.push(n);
+                }
+            }
             _ => app.gesture = Some(Gesture::Spot { points: vec![n] }),
         }
     }
     if let Some(Gesture::Spot { points }) = &app.gesture {
+        let preview_col = Color32::from_rgba_unmultiplied(98, 225, 175, 58);
+        for w_pts in points.windows(2) {
+            p.line_segment([map.screen(w_pts[0]), map.screen(w_pts[1])], Stroke::new(r * 2.0, preview_col));
+        }
         for q in points {
-            p.circle_filled(map.screen(*q), r, Color32::from_white_alpha(60));
+            p.circle_filled(map.screen(*q), r, Color32::from_white_alpha(42));
         }
     }
     if (resp.drag_stopped() || resp.clicked())
@@ -2905,8 +3001,8 @@ fn remove_overlay(app: &mut LightcraftApp, ui: &mut egui::Ui, resp: &egui::Respo
         let mode = match app.ui.tool.as_str() {
             "heal" => "heal",
             "clone" => "clone",
-            "fill" => "fill",
-            _ => "remove",
+            "remove" => "remove",
+            _ => "fill",
         };
         let pts: Vec<[f64; 2]> = points.iter().map(|q| [q.x, q.y]).collect();
         let _ = app.run(
@@ -2959,8 +3055,8 @@ fn spot_keys(app: &mut LightcraftApp, ui: &mut egui::Ui, map: &CanvasMap, d: &De
         let mode = match app.ui.tool.as_str() {
             "heal" => "heal",
             "clone" => "clone",
-            "fill" => "fill",
-            _ => "remove",
+            "remove" => "remove",
+            _ => "fill",
         };
         let _ = app.run(
             "spot.add",

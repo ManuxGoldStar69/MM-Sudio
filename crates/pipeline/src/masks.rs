@@ -1770,7 +1770,7 @@ pub fn color_range_tolerance(refine: f64) -> f32 {
     0.015 + 0.06 * (refine / 100.0).clamp(0.0, 1.0) as f32
 }
 
-fn detect_faces_cached(img: &Rgb32f, gain: f32) -> Vec<lightcraft_faces::yunet::Face> {
+pub(crate) fn detect_faces_cached(img: &Rgb32f, gain: f32) -> Vec<lightcraft_faces::yunet::Face> {
     use std::sync::{Mutex, OnceLock};
     static DETECTOR: OnceLock<Option<lightcraft_faces::yunet::Detector>> = OnceLock::new();
     // Cache entries: (resolution_independent_sig, detected_long_edge_px, faces)

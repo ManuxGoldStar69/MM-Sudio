@@ -183,8 +183,10 @@ pub struct FinishParams {
     pub ev: f32,
     /// Grain: amount, cell size (px), roughness, seed.
     pub grain: Option<(f32, f32, f32, u32)>,
-    /// High-resolution optical/creative overlay plan (Light Leaks, Bokeh, Sunbeams, Prism, Cinema).
+    /// High-resolution optical/creative overlay plan (Light Leaks, Bokeh, Sunbeams, Prism, Cinema, Birds, Rainbows, SunGlow, Clouds).
     pub overlay: Option<crate::overlays::OverlayPlan>,
+    /// Photorealistic 4K SmartSky replacement plan.
+    pub sky: Option<crate::smart_sky::SmartSkyPlan>,
     /// Output px → normalized oriented coordinates.
     pub out_to_norm: lightcraft_geom::Affine,
     pub ow: f64,
@@ -253,6 +255,7 @@ impl FinishParams {
             ev,
             grain,
             overlay: if effects { crate::overlays::OverlayPlan::from_settings(&s.overlay) } else { None },
+            sky: if effects { crate::smart_sky::SmartSkyPlan::from_settings(&s.sky) } else { None },
             out_to_norm: frame.out_to_norm(w, h),
             ow: frame.ow,
             oh: frame.oh,
@@ -270,6 +273,13 @@ impl FinishParams {
         self.out_luma = d.luma;
         self.out_trc = OutputTrc::Srgb;
         self.proof = proof.map(|pr| pr.params_display(d));
+    }
+
+    /// Computes and attaches the image-adaptive, YuNet face & person-shielded 2D sky matte when SmartSky is active.
+    pub fn prepare_sky_matte(&mut self, img: &lightcraft_raster::Rgb32f, frame: &Frame, ev: f32) {
+        if let Some(sky) = &mut self.sky {
+            sky.attach_photo_matte(img, frame, ev);
+        }
     }
 }
 
@@ -303,6 +313,7 @@ pub(crate) fn finish(
 ) -> Rgba8 {
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.prepare_sky_matte(&p.img, frame, fp.ev);
     fp.proof = proof.map(|pr| pr.params(space));
     if let Some(d) = display {
         fp.for_display(d, proof);
@@ -332,6 +343,7 @@ pub(crate) fn finish_deep(
     use lightcraft_color::transfer::srgb_to_linear;
     let (w, h) = (p.img.width, p.img.height);
     let mut fp = FinishParams::new(s, frame, info, w, h, p.px_per_long, p.air, space);
+    fp.prepare_sky_matte(&p.img, frame, fp.ev);
     fp.proof = proof.map(|pr| pr.params(space));
     let trc = fp.out_trc;
     let samples = match depth {
@@ -639,6 +651,12 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
                 if fp.refine_sat < 1.0 {
                     e = refine_saturation(e0, e, fp.refine_sat);
                 }
+            }
+            if let Some(sky) = &fp.sky {
+                let nx = (vx + x as f32 + 0.5) / vw;
+                let ny = (vy + y as f32 + 0.5) / vh;
+                let fine_det = l_pre - p.base.data[i];
+                e = sky.apply_srgb(e, nx, ny, fine_det);
             }
             if let Some(ovl) = &fp.overlay {
                 let nx = (vx + x as f32 + 0.5) / vw;

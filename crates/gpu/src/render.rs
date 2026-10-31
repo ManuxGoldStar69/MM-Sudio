@@ -666,6 +666,9 @@ pub fn render(
 
     // 4. masks
     let (masks, terms) = masks(&mut cx, &lin, &prep, &plan, &mut host);
+    if s.section_enabled("effects") && s.sky.is_active() && host.lin.is_none() {
+        host.lin = Some(Arc::new(cx.read_rgb(&lin, w, h)));
+    }
     planes.host_lin = host.lin.clone();
     planes.host_log_l = host.log_l.clone();
     if let Some(c) = stages {
@@ -675,6 +678,9 @@ pub fn render(
 
     // 5. per-pixel stage
     let mut fp = FinishParams::new(s, &plan.frame, info, w, h, plan.px_per_long, prep.air, req.space);
+    if let Some(img) = &host.lin {
+        fp.prepare_sky_matte(img, &plan.frame, fp.ev);
+    }
     if let Some(d) = &req.display {
         fp.for_display(d, None);
     }
@@ -685,6 +691,13 @@ pub fn render(
         chroma: masks.is_some() && prep.chroma.is_some(),
     };
     let (p, aux) = finish_block(&fp, &terms, &present);
+    if !gpu.fits(aux.len()) {
+        fail(
+            FailKind::Limit,
+            format!("aux needs {} MiB buffer, over the device's {} MiB storage-buffer limit", (aux.len() * 4).div_ceil(1 << 20), gpu.limit() >> 20),
+        );
+        return None;
+    }
     let aux = gpu.upload(&aux);
     // cleared, so that work which never ran cannot pass for an image (see the check below)
     let out = cx.zeroed(n);

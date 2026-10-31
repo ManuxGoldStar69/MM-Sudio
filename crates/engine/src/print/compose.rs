@@ -407,18 +407,48 @@ impl CellStyle {
 /// Draws `photo` into `cell` of `page`: border frame, the photo fitted or filled (and turned when
 /// asked), then the inner stroke on top of it. Returns where the photo landed.
 pub fn draw_cell(page: &mut Image16, photo: &Image16, cell: PxRect, style: &CellStyle) -> Result<PxRect, String> {
+    draw_cell_with_pan_zoom(page, photo, cell, style, 1.0, 0.0, 0.0)
+}
+
+/// Draws `photo` into `cell` of `page` with individual `zoom` (`1.0..=5.0`) and normalized `pan_x`, `pan_y` (`-1.0..=1.0`).
+pub fn draw_cell_with_pan_zoom(
+    page: &mut Image16,
+    photo: &Image16,
+    cell: PxRect,
+    style: &CellStyle,
+    zoom: f64,
+    pan_x: f64,
+    pan_y: f64,
+) -> Result<PxRect, String> {
     // The border may not eat the cell: at least one pixel of photo area stays.
     let border = style.border_px.min(cell.w.min(cell.h).saturating_sub(1) / 2);
     let (ax, ay) = (cell.x + border, cell.y + border);
     let (aw, ah) = (cell.w - 2 * border, cell.h - 2 * border);
     let p = place(photo.w as f64, photo.h as f64, aw, ah, style.fill, style.rotate).ok_or("a photo has no size")?;
-    let (uw, uh) = p.unturned();
+    let px = if pan_x.is_finite() { pan_x.clamp(-1.0, 1.0) } else { 0.0 };
+    let py = if pan_y.is_finite() { pan_y.clamp(-1.0, 1.0) } else { 0.0 };
+    let mut z = if zoom.is_finite() { zoom.clamp(1.0, 5.0) } else { 1.0 };
+    if style.fill {
+        if px.abs() > 1e-3 && (p.w as f64 * z) < aw as f64 * (1.0 + px.abs() * 0.35) {
+            z = z.max((aw as f64 * (1.0 + px.abs() * 0.35)) / (p.w.max(1) as f64));
+        }
+        if py.abs() > 1e-3 && (p.h as f64 * z) < ah as f64 * (1.0 + py.abs() * 0.35) {
+            z = z.max((ah as f64 * (1.0 + py.abs() * 0.35)) / (p.h.max(1) as f64));
+        }
+        z = z.clamp(1.0, 5.0);
+    }
+    let (base_uw, base_uh) = p.unturned();
+    let uw = ((base_uw as f64 * z).round() as usize).max(base_uw);
+    let uh = ((base_uh as f64 * z).round() as usize).max(base_uh);
     let mut img = photo.resized(uw, uh)?;
     if p.rotated {
         img = img.rotated_cw()?;
     }
-    // Where the photo lands: centred in the area, cropped to it when it overflows.
-    let (sx, sy) = (img.w.saturating_sub(aw) / 2, img.h.saturating_sub(ah) / 2);
+    // Where the photo lands: shifted by pan_x/pan_y within the available overflow, cropped to the cell.
+    let overflow_x = img.w.saturating_sub(aw);
+    let overflow_y = img.h.saturating_sub(ah);
+    let sx = ((overflow_x as f64 * (0.5 - px * 0.5)).round() as usize).min(overflow_x);
+    let sy = ((overflow_y as f64 * (0.5 - py * 0.5)).round() as usize).min(overflow_y);
     let (w, h) = (img.w.min(aw), img.h.min(ah));
     let (dx, dy) = (ax + (aw - w) / 2, ay + (ah - h) / 2);
     if border > 0 {
@@ -539,6 +569,10 @@ struct Item {
     page: usize,
     name: String,
     cell: PxRect,
+    zoom: f64,
+    pan_x: f64,
+    pan_y: f64,
+    caption: Option<String>,
     key: (u64, usize, usize),
     job: RenderJob,
 }
@@ -598,7 +632,17 @@ impl Prepared {
                     }
                 };
                 let photo = &cache.get(at).ok_or("render cache lost an entry")?.1;
-                placed.push(draw_cell(&mut page, photo, item.cell, &self.style).map_err(|e| format!("{}: {e}", item.name))?);
+                let rect_drawn = draw_cell_with_pan_zoom(&mut page, photo, item.cell, &self.style, item.zoom, item.pan_x, item.pan_y)
+                    .map_err(|e| format!("{}: {e}", item.name))?;
+                if let Some(cap) = &item.caption
+                    && !cap.trim().is_empty()
+                    && let Some(tl) = crate::text::TextLayout::new(cap, (11.0 / 72.0 * self.ppi).max(10.0), false, crate::fonts::CRAFT_FONTS)
+                {
+                    let tx = (rect_drawn.x as f32 + (rect_drawn.w as f32 - tl.width) * 0.5).max(0.0);
+                    let ty = ((rect_drawn.y + rect_drawn.h) as f32 - tl.height - 6.0).max(0.0);
+                    draw_text(&mut page, &tl, tx, ty, self.marks.ink);
+                }
+                placed.push(rect_drawn);
             }
             self.marks.draw(&mut page, &placed, index + 1);
             out.push(PageRaster { width: w as u32, height: h as u32, ppi: self.ppi, rgb: page.rgb });
@@ -640,7 +684,19 @@ pub fn prepare(session: &mut Session, settings: &PrintSettings, photos: &[PhotoI
     let style = CellStyle::of(&settings, ppi);
     let mut items = Vec::new();
     for (page, cells) in plan.iter().enumerate() {
-        for (rect, id) in cells {
+        let pkg_cells: Vec<_> = if settings.layout.style.is_package() {
+            settings.layout.cells_on_page(page as u32).collect()
+        } else {
+            Vec::new()
+        };
+        for (idx_in_page, (rect, id)) in cells.iter().enumerate() {
+            if settings.book.enabled
+                && settings.layout.style == Style::CustomPackage
+                && pkg_cells.get(idx_in_page).is_some_and(|c| c.photo.is_none())
+            {
+                // Empty magnetic frame in Photobook mode stays blank on export
+                continue;
+            }
             let Some(cell) = px_rect(rect, ppi, pw, ph) else { continue };
             let photo = session.catalog.photo(*id).ok_or_else(|| format!("no photo {}", id.0))?;
             let name = photo.file_name.clone();
@@ -648,9 +704,23 @@ pub fn prepare(session: &mut Session, settings: &PrintSettings, photos: &[PhotoI
             let border = style.border_px.min(cell.w.min(cell.h).saturating_sub(1) / 2);
             let (aw, ah) = (cell.w - 2 * border, cell.h - 2 * border);
             let p = place(nw as f64, nh as f64, aw, ah, style.fill, style.rotate).ok_or("a photo has no size")?;
+            let (zoom, pan_x, pan_y, caption) = pkg_cells
+                .get(idx_in_page)
+                .map(|c| (c.zoom, c.pan_x, c.pan_y, c.caption.clone()))
+                .unwrap_or((1.0, 0.0, 0.0, None));
             let (rw, rh) = p.unturned();
             let job = session.export_job(*id, rw, rh, OutputSpace::Rec2020, OutputDepth::U16)?;
-            items.push(Item { page, name, cell, key: (id.0, rw, rh), job });
+            items.push(Item {
+                page,
+                name,
+                cell,
+                zoom,
+                pan_x,
+                pan_y,
+                caption,
+                key: (id.0, rw, rh),
+                job,
+            });
         }
     }
     Ok(Prepared {

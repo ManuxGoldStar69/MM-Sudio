@@ -1246,12 +1246,20 @@ impl LightcraftApp {
             let dropped: Vec<String> =
                 ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().to_string()).filter(|p| !p.is_empty()).collect());
             // preset files import as presets, everything else as photos
-            // a dropped face model opens its licence dialog; presets and photos as before
+            // a dropped face model opens its licence dialog; .mmbook opens the Photobook project; presets and photos as before
             let (models, dropped): (Vec<String>, Vec<String>) = dropped.into_iter().partition(|p| is_model_file(p));
             if let Some(model) = models.first()
                 && let Err(e) = panels::faces::open_dialog(self, model)
             {
                 self.toast(ctx, e);
+            }
+            let (mmbooks, dropped): (Vec<String>, Vec<String>) = dropped
+                .into_iter()
+                .partition(|p| std::path::Path::new(p).extension().is_some_and(|e| e.eq_ignore_ascii_case("mmbook")));
+            if let Some(mmbook) = mmbooks.first()
+                && let Err(e) = self.run("app.openMmbook", serde_json::json!({"path": mmbook}))
+            {
+                self.toast_error(ctx, e);
             }
             let (presets, photos) = split_presets(dropped);
             if !presets.is_empty() {

@@ -139,10 +139,14 @@ pub struct DevelopSettings {
     pub enhance: Enhance,
     /// Camera calibration: shadows tint and primary hue/saturation (applied before tone mapping).
     pub calibration: Calibration,
-    /// Creative optical overlay (Light Leaks, Bokeh, Sunbeams, Prism/Halation, Anamorphic/Weather).
+    /// Creative optical overlay (Light Leaks, Bokeh, Sunbeams, Prism/Halation, Anamorphic/Weather, Birds, Rainbows, SunGlow, Clouds).
     /// Omitted when at default (`preset == 0`) so existing settings JSON and hashes stay identical.
     #[serde(default, skip_serializing_if = "CreativeOverlay::is_default")]
     pub overlay: CreativeOverlay,
+    /// Photorealistic 4K Sky Replacement (`SmartSky`: 100 4K skies across 7 categories).
+    /// Omitted when at default (`preset == 0`) so existing settings JSON and hashes stay identical.
+    #[serde(default, skip_serializing_if = "SmartSky::is_default")]
+    pub sky: SmartSky,
     /// Section on/off toggles (the "eye" buttons on panel headers): section id → enabled.
     pub disabled_sections: Vec<String>,
 }
@@ -178,6 +182,7 @@ impl Default for DevelopSettings {
             enhance: Enhance::default(),
             calibration: Calibration::default(),
             overlay: CreativeOverlay::default(),
+            sky: SmartSky::default(),
             disabled_sections: Vec::new(),
         }
     }
@@ -704,6 +709,71 @@ impl CreativeOverlay {
             || self.expand_left > 0.1
             || self.expand_right > 0.1
             || self.fill_borders >= 0.5
+    }
+}
+
+/// Photorealistic 4K Sky Replacement (`SmartSky`: 100 4K skies across 7 categories).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmartSky {
+    /// Preset index: 0 = Off, 1..=100 = active 4K sky card.
+    pub preset: f64,
+    /// Overall sky replacement opacity / strength (0..100, default 88).
+    pub amount: f64,
+    /// Atmospheric horizon blend feathering (0..100, default 45).
+    pub horizon_blend: f64,
+    /// Vertical horizon shift (-100..100, default 0).
+    pub horizon_pos: f64,
+    /// Edge-aware matting & halo defringe refinement for trees/leaves/hair (0..100, default 75).
+    pub edge_refine: f64,
+    /// Automatic foreground scene relighting & color harmonization (0..100, default 55).
+    pub relight: f64,
+    /// Atmospheric perspective mist / horizon haze (0..100, default 20).
+    pub haze: f64,
+    /// Lens depth-of-field bokeh blur on the sky (0..100, default 0).
+    pub defocus: f64,
+    /// Sky color temperature / warmth shift (-100..100, default 0).
+    pub warmth: f64,
+    /// Sky exposure / brightness adjustment (-100..100, default 0).
+    pub brightness: f64,
+    /// Horizontal pan offset of the sky (-100..100, default 0).
+    pub pos_x: f64,
+    /// Vertical pan offset of the sky (-100..100, default 0).
+    pub pos_y: f64,
+    /// Sky zoom / scale percentage (50..250, default 100).
+    pub scale: f64,
+    /// Horizontal mirror of the sky (0 = off, 1 = on).
+    pub flip_x: f64,
+}
+
+impl Default for SmartSky {
+    fn default() -> Self {
+        Self {
+            preset: 0.0,
+            amount: 100.0,
+            horizon_blend: 45.0,
+            horizon_pos: 0.0,
+            edge_refine: 75.0,
+            relight: 55.0,
+            haze: 20.0,
+            defocus: 0.0,
+            warmth: 0.0,
+            brightness: 0.0,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            scale: 100.0,
+            flip_x: 0.0,
+        }
+    }
+}
+
+impl SmartSky {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.preset.round() >= 1.0 && self.amount > 0.0
     }
 }
 

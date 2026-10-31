@@ -43,8 +43,10 @@ fn radius_px(size: f64, ppl: f64) -> f64 {
     (size * ppl).max(1.0)
 }
 
-/// Mean colour of `img` in a disc/annulus.
-fn ring_stats(img: &Rgb32f, c: (f32, f32), r0: f32, r1: f32) -> Option<Vec<[f32; 3]>> {
+/// Mean colour of `img` in a disc/annulus. When `require_all_inside` is true (source candidate),
+/// returns `None` if any sample falls outside the image bounds; when false (target ring near an edge),
+/// collects all in-bounds samples so edge-touching spots still find valid inward source patches.
+fn ring_stats(img: &Rgb32f, c: (f32, f32), r0: f32, r1: f32, require_all_inside: bool) -> Option<Vec<[f32; 3]>> {
     let mut out = Vec::new();
     let n = 24;
     for i in 0..n {
@@ -52,18 +54,29 @@ fn ring_stats(img: &Rgb32f, c: (f32, f32), r0: f32, r1: f32) -> Option<Vec<[f32;
         for rr in [r0, (r0 + r1) / 2.0, r1] {
             let (x, y) = (c.0 + a.cos() * rr, c.1 + a.sin() * rr);
             if x < 0.0 || y < 0.0 || x >= img.width as f32 || y >= img.height as f32 {
-                return None;
+                if require_all_inside {
+                    return None;
+                }
+                continue;
             }
             out.push(img.sample_bilinear(x, y));
         }
+    }
+    if out.len() < 12 {
+        return None;
     }
     Some(out)
 }
 
 fn score(img: &Rgb32f, target: (f32, f32), source: (f32, f32), r: f32) -> f32 {
-    let (Some(a), Some(b)) = (ring_stats(img, target, r * 1.05, r * 1.6), ring_stats(img, source, r * 1.05, r * 1.6)) else { return f32::MAX };
+    let (Some(a), Some(b)) = (
+        ring_stats(img, target, r * 1.05, r * 1.6, false),
+        ring_stats(img, source, r * 1.05, r * 1.6, true),
+    ) else {
+        return f32::MAX;
+    };
     // Compare in perceptual Oklab (luminance + chrominance) plus interior texture roughness continuity
-    let inside = ring_stats(img, source, r * 0.2, r * 0.9);
+    let inside = ring_stats(img, source, r * 0.2, r * 0.9, true);
     let to_lab = |rgb: &[f32; 3]| lightcraft_color::perceptual::oklab_from_2020(rgb.map(|v| v.max(0.0)));
     let mut s = 0.0;
     for (p, q) in a.iter().zip(&b) {
@@ -104,7 +117,8 @@ pub fn ranked_sources(img: &Rgb32f, target: (f32, f32), r: f32) -> Vec<(f32, f32
 
 /// Pick a source offset (in output pixels) for a remove/heal spot.
 pub fn auto_source(img: &Rgb32f, target: (f32, f32), r: f32) -> (f32, f32) {
-    ranked_sources(img, target, r).first().copied().unwrap_or((r * 2.5, 0.0))
+    let fallback_dx = if target.0 > img.width as f32 * 0.5 { -r * 2.5 } else { r * 2.5 };
+    ranked_sources(img, target, r).first().copied().unwrap_or((fallback_dx, 0.0))
 }
 
 /// A source offset (normalized, as [`Spot::source_offset`]) for `spot` on `src` developed with
@@ -188,27 +202,28 @@ pub fn window_for_reads_checked(
     let to_out = frame.norm_to_out(full_w, full_h);
     let origin = to_out.apply(Point::new(0.0, 0.0));
     // (target box, source box) of each spot, in output pixels: [x0, y0, x1, y1]
-    let boxes: Vec<([f64; 4], [f64; 4])> = spots
-        .iter()
-        .filter_map(|spot| {
-            let r = radius_px(spot.size, ppl);
-            let pts: Vec<_> = spot.points.iter().map(|p| to_out.apply(*p)).collect();
-            let first = pts.first()?;
-            let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
-            for p in &pts {
-                (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
+    // Connected/nearby `SpotMode::Fill` strokes are merged into unified clusters first so multi-stroke
+    // object removals (`Borrar Objetos IA (3)`) share a single square context window.
+    let mut fill_clusters: Vec<[f64; 5]> = Vec::new(); // [x0, y0, x1, y1, max_r]
+    let mut boxes: Vec<([f64; 4], [f64; 4])> = Vec::new();
+    for spot in spots {
+        let r = radius_px(spot.size, ppl);
+        let pts: Vec<_> = spot.points.iter().map(|p| to_out.apply(*p)).collect();
+        let Some(first) = pts.first() else { continue };
+        let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+        for p in &pts {
+            (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
+        }
+        if spot.mode == SpotMode::Fill
+            || (spot.mode == SpotMode::Remove && (spot.source_offset.is_none() || pts.len() >= 12) && pts.len() >= 2)
+        {
+            let b = [x0 - r, y0 - r, x1 + r, y1 + r, r];
+            if b.iter().all(|v| v.is_finite()) {
+                fill_clusters.push(b);
             }
-            // the box `apply` works in: the stroke plus a radius, plus context padding (40% of bbox or 2r for AI Fill)
-            let (pad_x, pad_y) = if spot.mode == SpotMode::Fill {
-                let sw = (x1 - x0 + 2.0 * r).max(1.0);
-                let sh = (y1 - y0 + 2.0 * r).max(1.0);
-                ((sw * 0.40).max(2.0 * r) + r, (sh * 0.40).max(2.0 * r) + r)
-            } else {
-                (2.0 * r, 2.0 * r)
-            };
-            let t = [x0 - pad_x, y0 - pad_y, x1 + pad_x, y1 + pad_y];
+        } else {
+            let t = [x0 - 2.0 * r, y0 - 2.0 * r, x1 + 2.0 * r, y1 + 2.0 * r];
             let s = match spot.source_offset {
-                _ if spot.mode == SpotMode::Fill => t,
                 Some(o) => {
                     let b = to_out.apply(o);
                     let (dx, dy) = (b.x - origin.x, b.y - origin.y);
@@ -216,9 +231,73 @@ pub fn window_for_reads_checked(
                 }
                 None => [t[0] - 4.2 * r, t[1] - 4.2 * r, t[2] + 4.2 * r, t[3] + 4.2 * r],
             };
-            Some((t, s)).filter(|(t, s)| t.iter().chain(s).all(|v| v.is_finite()))
-        })
-        .collect();
+            if t.iter().chain(&s).all(|v| v.is_finite()) {
+                boxes.push((t, s));
+            }
+        }
+    }
+    loop {
+        let mut merged_any = false;
+        let mut i = 0;
+        while i < fill_clusters.len() {
+            let mut j = i + 1;
+            while j < fill_clusters.len() {
+                let a = fill_clusters[i];
+                let b = fill_clusters[j];
+                let gap = 2.5 * a[4].max(b[4]);
+                if a[0] - gap <= b[2] && a[2] + gap >= b[0] && a[1] - gap <= b[3] && a[3] + gap >= b[1] {
+                    fill_clusters[i] = [
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                        a[4].max(b[4]),
+                    ];
+                    fill_clusters.remove(j);
+                    merged_any = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+        if !merged_any {
+            break;
+        }
+    }
+    for c in fill_clusters {
+        let (x0, y0, x1, y1, r) = (c[0], c[1], c[2], c[3], c[4]);
+        let sw = (x1 - x0).max(1.0);
+        let sh = (y1 - y0).max(1.0);
+        let cx = 0.5 * (x0 + x1);
+        let cy = 0.5 * (y0 + y1);
+        let wf = full_w as f64;
+        let hf = full_h as f64;
+        let sx = (sw * 1.85).max(sw + 6.5 * r).max(sh * 0.85).min(wf);
+        let sy = (sh * 2.15).max(sh + 6.5 * r).max(sw * 0.62).min(hf);
+        let mut rx0 = cx - 0.5 * sx;
+        let mut rx1 = cx + 0.5 * sx;
+        if rx0 < 0.0 {
+            rx1 = (rx1 - rx0).min(wf);
+            rx0 = 0.0;
+        }
+        if rx1 > wf {
+            rx0 = (rx0 - (rx1 - wf)).max(0.0);
+            rx1 = wf;
+        }
+        let mut ry0 = cy - 0.5 * sy;
+        let mut ry1 = cy + 0.5 * sy;
+        if ry0 < 0.0 {
+            ry1 = (ry1 - ry0).min(hf);
+            ry0 = 0.0;
+        }
+        if ry1 > hf {
+            ry0 = (ry0 - (ry1 - hf)).max(0.0);
+            ry1 = hf;
+        }
+        let t = [rx0, ry0, rx1, ry1];
+        boxes.push((t, t));
+    }
     // Auto Mask strokes weigh each dab by its similarity to the pixel under the dab's centre and
     // refine the stroke over a couple of radii: each dab matters to pixels within 2.5 radii
     let mut dab_boxes: Vec<[f64; 4]> = Vec::new();
@@ -273,50 +352,114 @@ pub fn window_for_reads_checked(
     )
 }
 
-static LAMA_PATCH_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<(u64, Vec<[f32; 3]>)>>> =
+struct CachedSpotPatch {
+    seed: u64,
+    mode_tag: u64,
+    bw: usize,
+    bh: usize,
+    grid_sig: [f32; 96],
+    pixels: Vec<[f32; 3]>,
+}
+
+static LAMA_PATCH_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<CachedSpotPatch>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-fn lama_cache_key(tgt: &[[f32; 3]], hole: &[bool], bw: usize, bh: usize) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bw.hash(&mut h);
-    bh.hash(&mut h);
-    let step = (tgt.len() / 256).max(1);
-    for i in (0..tgt.len()).step_by(step) {
-        tgt[i][0].to_bits().hash(&mut h);
-        tgt[i][1].to_bits().hash(&mut h);
-        tgt[i][2].to_bits().hash(&mut h);
+fn spot_grid_sig(tgt: &[[f32; 3]], hole: &[bool], bw: usize, bh: usize) -> [f32; 96] {
+    let mut sums = [0.0f32; 96];
+    let mut cnts = [0.0f32; 32];
+    for y in 0..bh {
+        let gy = ((y * 2) / bh.max(1)).min(1);
+        for x in 0..bw {
+            let i = y * bw + x;
+            if !hole[i] {
+                let gx = ((x * 16) / bw.max(1)).min(15);
+                let b = gy * 16 + gx;
+                sums[b * 3] += tgt[i][0];
+                sums[b * 3 + 1] += tgt[i][1];
+                sums[b * 3 + 2] += tgt[i][2];
+                cnts[b] += 1.0;
+            }
+        }
     }
-    let hstep = (hole.len() / 512).max(1);
-    for i in (0..hole.len()).step_by(hstep) {
-        hole[i].hash(&mut h);
+    for b in 0..32 {
+        if cnts[b] > 0.0 {
+            let inv = 1.0 / cnts[b];
+            sums[b * 3] *= inv;
+            sums[b * 3 + 1] *= inv;
+            sums[b * 3 + 2] *= inv;
+        }
     }
-    h.finish()
+    sums
+}
+
+fn spot_grid_matches(a: &[f32; 96], b: &[f32; 96]) -> bool {
+    let mut sum_diff = 0.0f32;
+    let mut max_diff = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let d = (x - y).abs();
+        sum_diff += d;
+        if d > max_diff {
+            max_diff = d;
+        }
+    }
+    (sum_diff / 96.0) <= 0.025 && max_diff <= 0.085
 }
 
 /// Content-aware LaMa local inpainting of the 40%-context bounding box: `src` becomes `tgt` with
 /// every pixel under the binary stroke mask (`alpha > 0.05`) reconstructed via `inpaint_lama_box`
 /// (rescaled to 512×512 or 1024×1024 for speed, with ISO-matched grain synthesis and LRU caching).
-fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh: usize) {
-    let hole: Vec<bool> = alpha.iter().map(|a| *a > 0.05).collect();
-    if !hole.iter().any(|&h| h) {
+fn fill_box(
+    src: &mut [[f32; 3]],
+    tgt: &[[f32; 3]],
+    alpha: &[f32],
+    bw: usize,
+    bh: usize,
+    group_seed: u64,
+    is_thumb_pass: bool,
+) {
+    let raw_hole: Vec<bool> = alpha.iter().map(|a| *a > 0.02).collect();
+    if !raw_hole.iter().any(|&h| h) {
         for (d, v) in src.iter_mut().zip(tgt.iter()) {
             *d = *v;
         }
         return;
     }
-    let key = lama_cache_key(tgt, &hole, bw, bh);
-    if let Ok(guard) = LAMA_PATCH_CACHE.lock()
-        && let Some((_, cached)) = guard.iter().find(|(k, v)| *k == key && v.len() == src.len())
+    // Dilate binary mask by 1px (inpaint_lama_box dilates by 2px more) so the outer seam is inside the reconstructed zone
+    let mut hole = raw_hole.clone();
+    for y in 0..bh {
+        for x in 0..bw {
+            if raw_hole[y * bw + x] {
+                for dy in -1isize..=1 {
+                    for dx in -1isize..=1 {
+                        let ny = (y as isize + dy).clamp(0, (bh - 1) as isize) as usize;
+                        let nx = (x as isize + dx).clamp(0, (bw - 1) as isize) as usize;
+                        hole[ny * bw + nx] = true;
+                    }
+                }
+            }
+        }
+    }
+    let grid_sig = spot_grid_sig(tgt, &hole, bw, bh);
+    let (cloud_configured, mode_tag) = lightcraft_inpaint::current_cloud_mode_tag();
+    if !is_thumb_pass
+        && let Ok(guard) = LAMA_PATCH_CACHE.lock()
+        && let Some(cached) = guard.iter().find(|c| {
+            c.seed == group_seed
+                && c.mode_tag == mode_tag
+                && c.bw == bw
+                && c.bh == bh
+                && c.pixels.len() == src.len()
+                && spot_grid_matches(&c.grid_sig, &grid_sig)
+        })
     {
-        src.copy_from_slice(cached);
+        src.copy_from_slice(&cached.pixels);
         return;
     }
     let flat: Vec<f32> = tgt.iter().flatten().copied().collect();
-    let max_side = 1024;
+    let max_side = if is_thumb_pass { 512 } else { 1024 };
     let cfg = lightcraft_inpaint::LamaConfig {
         max_side,
-        seed: key ^ 0x4C41_4D42,
+        seed: group_seed,
         iso: 0,
     };
     let out = lightcraft_inpaint::inpaint_lama_box(&flat, &hole, bw, bh, &cfg);
@@ -324,11 +467,32 @@ fn fill_box(src: &mut [[f32; 3]], tgt: &[[f32; 3]], alpha: &[f32], bw: usize, bh
     for (d, v) in src.iter_mut().zip(pixels) {
         *d = *v;
     }
-    if let Ok(mut guard) = LAMA_PATCH_CACHE.lock() {
-        if guard.len() >= 24 {
-            guard.remove(0);
+    let can_cache_patch = !is_thumb_pass
+        && (!cloud_configured
+            || (group_seed & 1 == 1)
+            || lightcraft_inpaint::is_cloud_seed_cached(group_seed, mode_tag));
+    if can_cache_patch
+        && let Ok(mut guard) = LAMA_PATCH_CACHE.lock()
+    {
+        if let Some(existing) = guard
+            .iter_mut()
+            .find(|c| c.seed == group_seed && c.mode_tag == mode_tag && c.bw == bw && c.bh == bh)
+        {
+            existing.grid_sig = grid_sig;
+            existing.pixels = src.to_vec();
+        } else {
+            if guard.len() >= 24 {
+                guard.remove(0);
+            }
+            guard.push(CachedSpotPatch {
+                seed: group_seed,
+                mode_tag,
+                bw,
+                bh,
+                grid_sig,
+                pixels: src.to_vec(),
+            });
         }
-        guard.push((key, src.to_vec()));
     }
 }
 
@@ -461,6 +625,44 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
     }
     let (w, h) = (img.width, img.height);
     let to_out = frame.norm_to_out(w, h);
+    let seg_dist_sq = |px: f32, py: f32, a: (f32, f32), b: (f32, f32)| -> f32 {
+        let dx = b.0 - a.0;
+        let dy = b.1 - a.1;
+        let len_sq = dx * dx + dy * dy;
+        if len_sq <= 1e-6 {
+            return (px - a.0).powi(2) + (py - a.1).powi(2);
+        }
+        let t = (((px - a.0) * dx + (py - a.1) * dy) / len_sq).clamp(0.0, 1.0);
+        let qx = a.0 + t * dx;
+        let qy = a.1 + t * dy;
+        (px - qx).powi(2) + (py - qy).powi(2)
+    };
+
+    // 1. Collect and cluster `SpotMode::Fill` strokes so multi-stroke object removals (`Borrar Objetos IA (3)`)
+    //    are combined into a single unified mask and inpainted in one single pass (never copying un-erased
+    //    parts of Stroke 2/3 into Stroke 1!).
+    struct FillStroke {
+        pts: Vec<(f32, f32)>,
+        r: f32,
+        inner: f32,
+        outer: f32,
+        opacity: f32,
+        bbox: [f32; 4],
+        spot_hash: u64,
+    }
+    let mut fill_groups: Vec<Vec<FillStroke>> = Vec::new();
+    let (photo_x0, photo_y0, photo_x1, photo_y1, photo_w, photo_h) = match frame.view {
+        Some(vw) => (
+            -(vw.x as f32),
+            -(vw.y as f32),
+            (vw.full_w as f32) - (vw.x as f32),
+            (vw.full_h as f32) - (vw.y as f32),
+            vw.full_w as f32,
+            vw.full_h as f32,
+        ),
+        None => (0.0, 0.0, w as f32, h as f32, w as f32, h as f32),
+    };
+
     for spot in spots {
         let opacity = (spot.opacity / 100.0).clamp(0.0, 1.0) as f32;
         if opacity <= 0.0 {
@@ -476,17 +678,6 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             })
             .collect();
         let Some(&first) = pts.first() else { continue };
-        let fill = spot.mode == SpotMode::Fill;
-        let offset = match spot.source_offset {
-            _ if fill => (0.0, 0.0),
-            Some(o) => {
-                let a = to_out.apply(Point::new(0.0, 0.0));
-                let b = to_out.apply(o);
-                ((b.x - a.x) as f32, (b.y - a.y) as f32)
-            }
-            None => auto_source(img, first, r),
-        };
-        // Tight bounding box of the stroke.
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for p in &pts {
             x0 = x0.min(p.0 - r);
@@ -494,44 +685,82 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
             x1 = x1.max(p.0 + r);
             y1 = y1.max(p.1 + r);
         }
-        // In AI LaMa mode (`Fill`), crop with a 40% context margin around the stroke bbox (at least 2r)
-        let (pad_x, pad_y) = if fill {
-            let sw = (x1 - x0).max(1.0);
-            let sh = (y1 - y0).max(1.0);
-            ((sw * 0.40).max(2.0 * r), (sh * 0.40).max(2.0 * r))
-        } else {
-            (r, r)
+        let feather = (spot.feather / 100.0).clamp(0.0, 1.0) as f32;
+
+        if spot.mode == SpotMode::Fill
+            || (spot.mode == SpotMode::Remove && (spot.source_offset.is_none() || pts.len() >= 12) && pts.len() >= 2)
+        {
+            let mut sh = DefaultHasher::new();
+            (spot.mode as u8).hash(&mut sh);
+            spot.size.to_bits().hash(&mut sh);
+            spot.feather.to_bits().hash(&mut sh);
+            spot.opacity.to_bits().hash(&mut sh);
+            if spot.mode == SpotMode::Fill
+                && let Some(so) = spot.source_offset
+            {
+                so.x.to_bits().hash(&mut sh);
+                so.y.to_bits().hash(&mut sh);
+            }
+            for pt in &spot.points {
+                pt.x.to_bits().hash(&mut sh);
+                pt.y.to_bits().hash(&mut sh);
+            }
+            let spot_hash = sh.finish();
+            let min_seam = (r * 0.30).clamp(2.0, 9.0);
+            let extra_seam = (r * feather * 0.35).clamp(0.0, 14.0);
+            let seam = (min_seam + extra_seam).min(r * 0.45);
+            let (inner, outer) = ((r - seam).max(0.0), r);
+            fill_groups.push(vec![FillStroke {
+                pts,
+                r,
+                inner,
+                outer,
+                opacity,
+                bbox: [x0, y0, x1, y1],
+                spot_hash,
+            }]);
+            continue;
+        }
+
+        // Non-Fill (`Remove`, `Heal`, `Clone`) spots run directly:
+        let offset = match spot.source_offset {
+            Some(o) => {
+                let a = to_out.apply(Point::new(0.0, 0.0));
+                let b = to_out.apply(o);
+                ((b.x - a.x) as f32, (b.y - a.y) as f32)
+            }
+            None => auto_source(img, first, r),
         };
-        let (bx0, by0) = (((x0 - pad_x).floor().max(0.0)) as usize, ((y0 - pad_y).floor().max(0.0)) as usize);
-        let (bx1, by1) = (((x1 + pad_x).ceil() as usize).min(w), ((y1 + pad_y).ceil() as usize).min(h));
+        let (bx0, by0, bx1, by1) = (
+            ((x0 - r).floor().max(0.0)) as usize,
+            ((y0 - r).floor().max(0.0)) as usize,
+            ((x1 + r).ceil() as usize).min(w),
+            ((y1 + r).ceil() as usize).min(h),
+        );
         if bx1 <= bx0 || by1 <= by0 {
             continue;
         }
         let (bw, bh) = (bx1 - bx0, by1 - by0);
-        let feather = (spot.feather / 100.0).clamp(0.0, 1.0) as f32;
-        // For AI Fill, when feather > 0, enforce a smooth 8px feather (scaled to output resolution)
-        let feather_band = if fill && feather > 0.0 {
-            let px_8 = (8.0 * (ppl as f32 / 1200.0)).max(1.5).min(r * 0.9);
-            (r * feather * 0.8).max(px_8)
-        } else {
-            r * feather * 0.8
-        };
-        let inner = (r - feather_band).max(0.0);
-        // alpha of the stroke and source patch in the box
+        let band = r * feather * 0.8;
+        let (inner, outer) = ((r - band).max(0.0), r);
         let mut alpha = vec![0.0f32; bw * bh];
         let mut src = vec![[0.0f32; 3]; bw * bh];
         let mut tgt = vec![[0.0f32; 3]; bw * bh];
         for y in 0..bh {
             for x in 0..bw {
                 let (px, py) = ((bx0 + x) as f32 + 0.5, (by0 + y) as f32 + 0.5);
-                let d = pts.iter().map(|p| ((px - p.0).powi(2) + (py - p.1).powi(2)).sqrt()).fold(f32::MAX, f32::min);
-                alpha[y * bw + x] = (1.0 - smooth(inner, r, d)) * opacity;
+                let d_sq = if pts.len() >= 2 {
+                    pts.windows(2)
+                        .map(|w_pts| seg_dist_sq(px, py, w_pts[0], w_pts[1]))
+                        .fold(f32::MAX, f32::min)
+                } else {
+                    pts.iter().map(|p| (px - p.0).powi(2) + (py - p.1).powi(2)).fold(f32::MAX, f32::min)
+                };
+                let d = d_sq.sqrt();
+                alpha[y * bw + x] = (1.0 - smooth(inner, outer, d)) * opacity;
                 src[y * bw + x] = img.sample_bilinear(px + offset.0, py + offset.1);
                 tgt[y * bw + x] = img.get(bx0 + x, by0 + y);
             }
-        }
-        if fill {
-            fill_box(&mut src, &tgt, &alpha, bw, bh);
         }
         let heal = matches!(spot.mode, SpotMode::Remove | SpotMode::Heal);
         let healed = if heal {
@@ -550,6 +779,650 @@ pub fn apply(img: &mut Rgb32f, spots: &[Spot], frame: &Frame, ppl: f64) {
                     Some(h_buf) => h_buf[i],
                     None => src[i],
                 };
+                let t = tgt[i];
+                img.set(bx0 + x, by0 + y, [t[0] + (v[0] - t[0]) * a, t[1] + (v[1] - t[1]) * a, t[2] + (v[2] - t[2]) * a].map(|c| c.max(0.0)));
+            }
+        }
+    }
+
+    // 2. Merge overlapping or nearby `SpotMode::Fill` groups (`gap <= 2.5 * max_r`)
+    let group_bounds = |g: &[FillStroke]| -> ([f32; 4], f32) {
+        let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        let mut mr = 1.0f32;
+        for s in g {
+            b[0] = b[0].min(s.bbox[0]);
+            b[1] = b[1].min(s.bbox[1]);
+            b[2] = b[2].max(s.bbox[2]);
+            b[3] = b[3].max(s.bbox[3]);
+            mr = mr.max(s.r);
+        }
+        (b, mr)
+    };
+    if !lightcraft_inpaint::current_cloud_mode_tag().0 {
+        loop {
+            let mut merged_any = false;
+            let mut i = 0;
+            while i < fill_groups.len() {
+                let mut j = i + 1;
+                while j < fill_groups.len() {
+                    let (ba, ra) = group_bounds(&fill_groups[i]);
+                    let (bb, rb) = group_bounds(&fill_groups[j]);
+                    let gap = 2.5 * ra.max(rb);
+                    if ba[0] - gap <= bb[2] && ba[2] + gap >= bb[0] && ba[1] - gap <= bb[3] && ba[3] + gap >= bb[1] {
+                        let removed = fill_groups.remove(j);
+                        fill_groups[i].extend(removed);
+                        merged_any = true;
+                    } else {
+                        j += 1;
+                    }
+                }
+                i += 1;
+            }
+            if !merged_any {
+                break;
+            }
+        }
+    }
+
+    // 3. Process each unified `SpotMode::Fill` group in a single combined pass
+    for group in fill_groups {
+        let (gb, r) = group_bounds(&group);
+        let (x0, y0, x1, y1) = (gb[0], gb[1], gb[2], gb[3]);
+        let wf = w as f32;
+        let hf = h as f32;
+        if x1 + r <= 0.0 || x0 - r >= wf || y1 + r <= 0.0 || y0 - r >= hf {
+            continue;
+        }
+        let sw = (x1 - x0).max(1.0);
+        let sh = (y1 - y0).max(1.0);
+        let cx = 0.5 * (x0 + x1);
+        let sx = (sw * 1.85).max(sw + 6.5 * r).max(sh * 0.85).min(photo_w);
+        let sy = (sh * 2.15).max(sh + 6.5 * r).max(sw * 0.62).min(photo_h);
+        let mut rx0 = (cx - 0.5 * sx).floor();
+        let mut rx1 = (cx + 0.5 * sx).ceil();
+        if rx0 < photo_x0 {
+            rx1 = (rx1 + (photo_x0 - rx0)).min(photo_x1);
+            rx0 = photo_x0;
+        }
+        if rx1 > photo_x1 {
+            rx0 = (rx0 - (rx1 - photo_x1)).max(photo_x0);
+            rx1 = photo_x1;
+        }
+        let cy = 0.5 * (y0 + y1);
+        let mut ry0 = (cy - 0.5 * sy).floor();
+        let mut ry1 = (cy + 0.5 * sy).ceil();
+        if ry0 < photo_y0 {
+            ry1 = (ry1 + (photo_y0 - ry0)).min(photo_y1);
+            ry0 = photo_y0;
+        }
+        if ry1 > photo_y1 {
+            ry0 = (ry0 - (ry1 - photo_y1)).max(photo_y0);
+            ry1 = photo_y1;
+        }
+        let (bx0, by0, bx1, by1) = (
+            rx0.max(0.0) as usize,
+            ry0.max(0.0) as usize,
+            (rx1.max(0.0) as usize).min(w),
+            (ry1.max(0.0) as usize).min(h),
+        );
+        if bx1 <= bx0 || by1 <= by0 {
+            continue;
+        }
+        let mut hashes: Vec<u64> = group.iter().map(|s| s.spot_hash).collect();
+        hashes.sort_unstable();
+        let mut gh = DefaultHasher::new();
+        0x5350_4F54_4752_5031u64.hash(&mut gh);
+        for h_val in hashes {
+            h_val.hash(&mut gh);
+        }
+        frame.orient.hash(&mut gh);
+        frame.flip_h.hash(&mut gh);
+        frame.flip_v.hash(&mut gh);
+        let raw_seed = gh.finish();
+        let photo_long = photo_w.max(photo_h).max(1.0);
+        let norm_group_span = sw.max(sh) / photo_long;
+        let is_compact_blemish = group.len() == 1 && norm_group_span <= 0.022 && sw.max(sh) <= 3.4 * r;
+        let group_seed = if is_compact_blemish {
+            raw_seed | 1
+        } else {
+            (raw_seed & !1).max(2)
+        };
+        let at_left_border = (bx0 as f32 - photo_x0).abs() <= 1.5;
+        let at_right_border = (bx1 as f32 - photo_x1).abs() <= 1.5;
+        let at_top_border = (by0 as f32 - photo_y0).abs() <= 1.5;
+        let at_bottom_border = (by1 as f32 - photo_y1).abs() <= 1.5;
+        let (bw, bh) = (bx1 - bx0, by1 - by0);
+        let mut alpha = vec![0.0f32; bw * bh];
+        let mut src = vec![[0.0f32; 3]; bw * bh];
+        let mut tgt = vec![[0.0f32; 3]; bw * bh];
+        let mut max_opacity = 0.0f32;
+        let mut max_seam = 4.0f32;
+        let mut total_pts = 0usize;
+        struct Seg {
+            a: (f32, f32),
+            b: (f32, f32),
+            x0: f32,
+            y0: f32,
+            x1: f32,
+            y1: f32,
+            inner: f32,
+            outer: f32,
+            opacity: f32,
+        }
+        let mut all_segs: Vec<Seg> = Vec::new();
+        for st in &group {
+            max_opacity = max_opacity.max(st.opacity);
+            max_seam = max_seam.max(st.outer - st.inner);
+            total_pts += st.pts.len();
+            let min_step_sq = (st.r * 0.06).max(1.5).powi(2);
+            let mut dec_pts: Vec<(f32, f32)> = Vec::with_capacity(st.pts.len());
+            for (idx, &p) in st.pts.iter().enumerate() {
+                if idx == 0 || idx + 1 == st.pts.len() {
+                    dec_pts.push(p);
+                } else if let Some(&last) = dec_pts.last()
+                    && (p.0 - last.0).powi(2) + (p.1 - last.1).powi(2) >= min_step_sq
+                {
+                    dec_pts.push(p);
+                }
+            }
+            let pad = st.outer + 1.0;
+            if dec_pts.len() >= 2 {
+                for w_pts in dec_pts.windows(2) {
+                    let (a, b) = (w_pts[0], w_pts[1]);
+                    all_segs.push(Seg {
+                        a,
+                        b,
+                        x0: a.0.min(b.0) - pad,
+                        y0: a.1.min(b.1) - pad,
+                        x1: a.0.max(b.0) + pad,
+                        y1: a.1.max(b.1) + pad,
+                        inner: st.inner,
+                        outer: st.outer,
+                        opacity: st.opacity,
+                    });
+                }
+            } else if let Some(&a) = dec_pts.first() {
+                all_segs.push(Seg {
+                    a,
+                    b: a,
+                    x0: a.0 - pad,
+                    y0: a.1 - pad,
+                    x1: a.0 + pad,
+                    y1: a.1 + pad,
+                    inner: st.inner,
+                    outer: st.outer,
+                    opacity: st.opacity,
+                });
+            }
+        }
+        let mut row_segs: Vec<&Seg> = Vec::new();
+        for y in 0..bh {
+            let py = (by0 + y) as f32 + 0.5;
+            row_segs.clear();
+            let mut rx_min = f32::MAX;
+            let mut rx_max = f32::MIN;
+            for seg in &all_segs {
+                if py >= seg.y0 && py <= seg.y1 {
+                    rx_min = rx_min.min(seg.x0);
+                    rx_max = rx_max.max(seg.x1);
+                    row_segs.push(seg);
+                }
+            }
+            let x_start = ((rx_min - bx0 as f32).floor().max(0.0) as usize).min(bw);
+            let x_end = ((rx_max - bx0 as f32).ceil().max(0.0) as usize).min(bw);
+            for x in 0..bw {
+                let i = y * bw + x;
+                let px_rgb = img.get(bx0 + x, by0 + y);
+                src[i] = px_rgb;
+                tgt[i] = px_rgb;
+                if x >= x_start && x < x_end {
+                    let px = (bx0 + x) as f32 + 0.5;
+                    let mut a_max = 0.0f32;
+                    for seg in &row_segs {
+                        if px >= seg.x0 && px <= seg.x1 {
+                            let d_sq = seg_dist_sq(px, py, seg.a, seg.b);
+                            if d_sq < seg.outer * seg.outer {
+                                let d = d_sq.sqrt();
+                                let a = (1.0 - smooth(seg.inner, seg.outer, d)) * seg.opacity;
+                                if a > a_max {
+                                    a_max = a;
+                                }
+                            }
+                        }
+                    }
+                    alpha[i] = a_max;
+                }
+            }
+        }
+        // Fast O(bw * bh) bounded squared Euclidean distance to the nearest `true` pixel in `mask`.
+        let edt_sq_bounded = |mask: &[bool], max_r: usize| -> Vec<u32> {
+            let inf = (max_r + 1) as u32;
+            let inf_sq = inf * inf;
+            let mut dx = vec![inf as u16; bw * bh];
+            for y in 0..bh {
+                let row_o = y * bw;
+                let mut d = inf;
+                for x in 0..bw {
+                    d = if mask[row_o + x] { 0 } else { (d + 1).min(inf) };
+                    dx[row_o + x] = d as u16;
+                }
+                d = inf;
+                for x in (0..bw).rev() {
+                    d = (d + 1).min(dx[row_o + x] as u32);
+                    dx[row_o + x] = d as u16;
+                }
+            }
+            let mut dy_active = vec![inf as u16; bw * bh];
+            for y in 0..bh {
+                let row_o = y * bw;
+                for x in 0..bw {
+                    let prev = if y > 0 { dy_active[(y - 1) * bw + x] as u32 + 1 } else { inf };
+                    dy_active[row_o + x] = if (dx[row_o + x] as u32) <= max_r as u32 { 0 } else { prev.min(inf) as u16 };
+                }
+            }
+            for y in (0..bh).rev() {
+                let row_o = y * bw;
+                for x in 0..bw {
+                    let next = if y + 1 < bh { dy_active[(y + 1) * bw + x] as u32 + 1 } else { inf };
+                    if next < dy_active[row_o + x] as u32 {
+                        dy_active[row_o + x] = next as u16;
+                    }
+                }
+            }
+            let mut out = vec![inf_sq; bw * bh];
+            for y in 0..bh {
+                let row_o = y * bw;
+                for x in 0..bw {
+                    if dy_active[row_o + x] as usize > max_r {
+                        continue;
+                    }
+                    let d0 = dx[row_o + x] as u32;
+                    let mut best = (d0 * d0).min(inf_sq);
+                    if best == 0 {
+                        out[row_o + x] = 0;
+                        continue;
+                    }
+                    for d in 1..=max_r {
+                        let dy2 = (d * d) as u32;
+                        if dy2 >= best {
+                            break;
+                        }
+                        if y >= d {
+                            let du = dx[(y - d) * bw + x] as u32;
+                            best = best.min(dy2 + du * du);
+                        }
+                        if y + d < bh {
+                            let dd = dx[(y + d) * bw + x] as u32;
+                            best = best.min(dy2 + dd * dd);
+                        }
+                    }
+                    out[row_o + x] = best;
+                }
+            }
+            out
+        };
+
+        // For multi-point or multi-stroke AI Fill groups, seal any unbrushed pinholes/slits between passes
+        // via morphological closing + enclosed-island flood-fill (including small pockets trapped against a
+        // single outer photo border when erasing objects at the edge of the frame), then feather smoothly outward.
+        if total_pts >= 3 || group.len() >= 2 {
+            let mut core_mask: Vec<bool> = alpha.iter().map(|&a| a >= max_opacity * 0.50).collect();
+
+            let border_snap = (r * 0.75).clamp(6.0, 28.0).round() as usize;
+            if at_left_border {
+                for y in 0..bh {
+                    if let Some(mx) = (0..border_snap.min(bw)).rfind(|&x| core_mask[y * bw + x]) {
+                        for x in 0..=mx {
+                            core_mask[y * bw + x] = true;
+                        }
+                    }
+                }
+            }
+            if at_right_border {
+                let x_start = bw.saturating_sub(border_snap);
+                for y in 0..bh {
+                    if let Some(mx) = (x_start..bw).find(|&x| core_mask[y * bw + x]) {
+                        for x in mx..bw {
+                            core_mask[y * bw + x] = true;
+                        }
+                    }
+                }
+            }
+            if at_top_border {
+                for x in 0..bw {
+                    if let Some(my) = (0..border_snap.min(bh)).rfind(|&y| core_mask[y * bw + x]) {
+                        for y in 0..=my {
+                            core_mask[y * bw + x] = true;
+                        }
+                    }
+                }
+            }
+            if at_bottom_border {
+                let y_start = bh.saturating_sub(border_snap);
+                for x in 0..bw {
+                    if let Some(my) = (y_start..bh).find(|&y| core_mask[y * bw + x]) {
+                        for y in my..bh {
+                            core_mask[y * bw + x] = true;
+                        }
+                    }
+                }
+            }
+
+            let close_r = (r * 0.45).clamp(4.0, 16.0).round() as usize;
+            let close_r2 = (close_r * close_r) as u32;
+            let d2_core = edt_sq_bounded(&core_mask, close_r);
+            let mut dilated: Vec<bool> = d2_core.iter().map(|&d2| d2 <= close_r2).collect();
+
+            // Bridge small pockets trapped against a SINGLE outer photo border (e.g. concrete pillar at the right frame edge)
+            // Only bridge gaps up to `2.2 * r` along that border so wide background expanses are never bridged!
+            let max_border_gap = (r * 2.2).max(24.0) as usize;
+            if at_left_border {
+                let mut prev_y: Option<usize> = None;
+                for y in 0..bh {
+                    if dilated[y * bw] {
+                        if let Some(py) = prev_y
+                            && y > py + 1
+                            && (y - py) <= max_border_gap
+                        {
+                            for yy in (py + 1)..y {
+                                dilated[yy * bw] = true;
+                            }
+                        }
+                        prev_y = Some(y);
+                    }
+                }
+            }
+            if at_right_border && bw >= 1 {
+                let xr = bw - 1;
+                let mut prev_y: Option<usize> = None;
+                for y in 0..bh {
+                    if dilated[y * bw + xr] {
+                        if let Some(py) = prev_y
+                            && y > py + 1
+                            && (y - py) <= max_border_gap
+                        {
+                            for yy in (py + 1)..y {
+                                dilated[yy * bw + xr] = true;
+                            }
+                        }
+                        prev_y = Some(y);
+                    }
+                }
+            }
+            if at_top_border {
+                let mut prev_x: Option<usize> = None;
+                for x in 0..bw {
+                    if dilated[x] {
+                        if let Some(px) = prev_x
+                            && x > px + 1
+                            && (x - px) <= max_border_gap
+                        {
+                            for xx in (px + 1)..x {
+                                dilated[xx] = true;
+                            }
+                        }
+                        prev_x = Some(x);
+                    }
+                }
+            }
+            if at_bottom_border && bh >= 1 {
+                let yb = bh - 1;
+                let mut prev_x: Option<usize> = None;
+                for x in 0..bw {
+                    if dilated[yb * bw + x] {
+                        if let Some(px) = prev_x
+                            && x > px + 1
+                            && (x - px) <= max_border_gap
+                        {
+                            for xx in (px + 1)..x {
+                                dilated[yb * bw + xx] = true;
+                            }
+                        }
+                        prev_x = Some(x);
+                    }
+                }
+            }
+
+            let mut filled = dilated.clone();
+            let mut visited = dilated.clone();
+            let max_pinhole_area = ((r * r * 2.2).max(800.0) as usize).min((bw * bh) / 16);
+            let mut comp = Vec::new();
+            let mut queue = std::collections::VecDeque::new();
+            for sy in 0..bh {
+                for sx in 0..bw {
+                    let si = sy * bw + sx;
+                    if visited[si] {
+                        continue;
+                    }
+                    visited[si] = true;
+                    comp.clear();
+                    comp.push(si);
+                    queue.push_back((sx, sy));
+                    let mut touches_open_crop_edge = false;
+                    let mut photo_borders_mask = 0u8;
+                    let mut border_px_count = 0usize;
+                    while let Some((cx, cy)) = queue.pop_front() {
+                        if (cx == 0 && !at_left_border)
+                            || (cx + 1 == bw && !at_right_border)
+                            || (cy == 0 && !at_top_border)
+                            || (cy + 1 == bh && !at_bottom_border)
+                        {
+                            touches_open_crop_edge = true;
+                        }
+                        if cx == 0 && at_left_border {
+                            photo_borders_mask |= 1;
+                            border_px_count += 1;
+                        }
+                        if cx + 1 == bw && at_right_border {
+                            photo_borders_mask |= 2;
+                            border_px_count += 1;
+                        }
+                        if cy == 0 && at_top_border {
+                            photo_borders_mask |= 4;
+                            border_px_count += 1;
+                        }
+                        if cy + 1 == bh && at_bottom_border {
+                            photo_borders_mask |= 8;
+                            border_px_count += 1;
+                        }
+                        for (nx, ny) in [
+                            (cx.saturating_sub(1), cy),
+                            ((cx + 1).min(bw - 1), cy),
+                            (cx, cy.saturating_sub(1)),
+                            (cx, (cy + 1).min(bh - 1)),
+                        ] {
+                            let ni = ny * bw + nx;
+                            if !visited[ni] {
+                                visited[ni] = true;
+                                comp.push(ni);
+                                queue.push_back((nx, ny));
+                            }
+                        }
+                    }
+                    // Never flood-fill a corner of the photo (`photo_borders_mask.count_ones() >= 2`) or a wide border span!
+                    let valid_pinhole = if touches_open_crop_edge || photo_borders_mask.count_ones() >= 2 {
+                        false
+                    } else if photo_borders_mask.count_ones() == 1 {
+                        border_px_count <= max_border_gap && comp.len() <= max_pinhole_area / 2
+                    } else {
+                        comp.len() <= max_pinhole_area
+                    };
+                    if valid_pinhole {
+                        for &idx in &comp {
+                            filled[idx] = true;
+                        }
+                    }
+                }
+            }
+            let erode_r = close_r.saturating_sub(1).max(1);
+            let erode_r2 = (erode_r * erode_r) as u32;
+            let not_filled: Vec<bool> = filled.iter().map(|&b| !b).collect();
+            let d2_not_filled = edt_sq_bounded(&not_filled, erode_r);
+            let mut closed: Vec<bool> = (0..(bw * bh))
+                .map(|i| core_mask[i] || (filled[i] && d2_not_filled[i] > erode_r2))
+                .collect();
+            for i in 0..(bw * bh) {
+                if core_mask[i] {
+                    closed[i] = true;
+                }
+            }
+
+            // Smart Object-Silhouette Tightening for large brushes (`r >= 26.0`) over dark/neutral objects
+            // (e.g. studio flash umbrellas, booms, or stands in outdoor foliage/sky): runs after pinhole
+            // closing so multi-pass scribbles have a unified spine, then flood-fills connected object pixels
+            // and trims away excess brush overhang into surrounding sky, foliage, or adjacent tree trunks.
+            if !lightcraft_inpaint::current_cloud_mode_tag().0 && r >= 26.0 {
+                let not_closed: Vec<bool> = closed.iter().map(|&b| !b).collect();
+                let spine_depth = (r * 0.48).round().max(8.0) as usize;
+                let outer_depth = (r * 0.36).round().max(5.0) as usize;
+                let d2_edge = edt_sq_bounded(&not_closed, spine_depth);
+                let spine_d2 = (spine_depth * spine_depth) as u32;
+                let outer_d2 = (outer_depth * outer_depth) as u32;
+                let is_sky_or_fol = |rgb: [f32; 3]| -> bool {
+                    (rgb[2] > rgb[0] * 1.18 && rgb[2] > 0.08)
+                        || (rgb[1] > rgb[0] * 1.12 && rgb[1] > 0.045)
+                };
+                let is_dark_obj = |rgb: [f32; 3]| -> bool {
+                    rgb[0].max(rgb[1]).max(rgb[2]) < 0.068 && (rgb[1] - rgb[0]) <= 0.015
+                };
+                let is_warm_skin = |rgb: [f32; 3]| -> bool {
+                    rgb[0] > rgb[1] * 1.15 && (rgb[0] - rgb[1]) > 0.018 && rgb[0] > 0.08
+                };
+                let mut n_spine = 0usize;
+                let mut n_spine_dark = 0usize;
+                let mut n_spine_obj = 0usize;
+                let mut n_spine_skin = 0usize;
+                let mut n_outer = 0usize;
+                let mut n_outer_bg = 0usize;
+                for i in 0..(bw * bh) {
+                    if closed[i] {
+                        let c = tgt[i];
+                        if d2_edge[i] >= spine_d2 {
+                            n_spine += 1;
+                            if is_dark_obj(c) {
+                                n_spine_dark += 1;
+                            }
+                            if !is_sky_or_fol(c) {
+                                n_spine_obj += 1;
+                            }
+                            if is_warm_skin(c) {
+                                n_spine_skin += 1;
+                            }
+                        } else if d2_edge[i] <= outer_d2 {
+                            n_outer += 1;
+                            if is_sky_or_fol(c) {
+                                n_outer_bg += 1;
+                            }
+                        }
+                    }
+                }
+                if n_spine >= 32
+                    && n_outer >= 32
+                    && n_spine_dark * 100 >= n_spine * 32
+                    && n_spine_obj * 100 >= n_spine * 62
+                    && n_spine_skin * 100 <= n_spine * 10
+                    && n_outer_bg * 100 >= n_outer * 38
+                {
+                    let seed_depth = (r * 0.40).round().max(6.0) as usize;
+                    let seed_d2 = (seed_depth * seed_depth) as u32;
+                    let mut obj_vis = vec![false; bw * bh];
+                    let mut q = std::collections::VecDeque::new();
+                    for y in 0..bh {
+                        for x in 0..bw {
+                            let i = y * bw + x;
+                            if closed[i] && d2_edge[i] >= seed_d2 && !is_sky_or_fol(tgt[i]) {
+                                obj_vis[i] = true;
+                                q.push_back((x, y));
+                            }
+                        }
+                    }
+                    while let Some((cx, cy)) = q.pop_front() {
+                        for (nx, ny) in [
+                            (cx.saturating_sub(1), cy),
+                            ((cx + 1).min(bw - 1), cy),
+                            (cx, cy.saturating_sub(1)),
+                            (cx, (cy + 1).min(bh - 1)),
+                        ] {
+                            let ni = ny * bw + nx;
+                            if !obj_vis[ni] && closed[ni] && !is_sky_or_fol(tgt[ni]) {
+                                obj_vis[ni] = true;
+                                q.push_back((nx, ny));
+                            }
+                        }
+                    }
+                    let tight_r = (r * 0.14).clamp(7.0, 15.0).round() as usize;
+                    let tight_r2 = (tight_r * tight_r) as u32;
+                    let d2_obj = edt_sq_bounded(&obj_vis, tight_r);
+                    let mut tight_mask: Vec<bool> = (0..(bw * bh))
+                        .map(|i| closed[i] && d2_obj[i] <= tight_r2)
+                        .collect();
+                    // Never punch interior holes inside the tightened object silhouette: only trim
+                    // overhang pixels that are connected to the exterior (`!closed`).
+                    let mut ext_vis = vec![false; bw * bh];
+                    let mut eq = std::collections::VecDeque::new();
+                    for y in 0..bh {
+                        for x in 0..bw {
+                            let i = y * bw + x;
+                            if !closed[i] {
+                                ext_vis[i] = true;
+                                eq.push_back((x, y));
+                            }
+                        }
+                    }
+                    while let Some((cx, cy)) = eq.pop_front() {
+                        for (nx, ny) in [
+                            (cx.saturating_sub(1), cy),
+                            ((cx + 1).min(bw - 1), cy),
+                            (cx, cy.saturating_sub(1)),
+                            (cx, (cy + 1).min(bh - 1)),
+                        ] {
+                            let ni = ny * bw + nx;
+                            if !ext_vis[ni] && !tight_mask[ni] {
+                                ext_vis[ni] = true;
+                                eq.push_back((nx, ny));
+                            }
+                        }
+                    }
+                    for i in 0..(bw * bh) {
+                        if !ext_vis[i] {
+                            tight_mask[i] = true;
+                        }
+                    }
+                    if tight_mask.iter().filter(|&&b| b).count() >= n_spine / 2 {
+                        closed = std::mem::take(&mut tight_mask);
+                        for i in 0..(bw * bh) {
+                            if !closed[i] {
+                                alpha[i] = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let seam_r = (max_seam.ceil() as usize).clamp(4, 16);
+            let seam_r2 = (seam_r * seam_r) as u32;
+            let seam_f = seam_r as f32;
+            let d2_closed = edt_sq_bounded(&closed, seam_r);
+            for i in 0..(bw * bh) {
+                if closed[i] {
+                    alpha[i] = max_opacity;
+                } else if d2_closed[i] <= seam_r2 {
+                    let d_out = (d2_closed[i] as f32).sqrt();
+                    let closed_alpha = (1.0 - smooth(0.0, seam_f, d_out)) * max_opacity;
+                    alpha[i] = alpha[i].max(closed_alpha);
+                }
+            }
+        }
+        let is_thumb_pass = photo_long <= 520.0;
+        fill_box(&mut src, &tgt, &alpha, bw, bh, group_seed, is_thumb_pass);
+        for y in 0..bh {
+            for x in 0..bw {
+                let i = y * bw + x;
+                let a = alpha[i];
+                if a <= 0.0 {
+                    continue;
+                }
+                let v = src[i];
                 let t = tgt[i];
                 img.set(bx0 + x, by0 + y, [t[0] + (v[0] - t[0]) * a, t[1] + (v[1] - t[1]) * a, t[2] + (v[2] - t[2]) * a].map(|c| c.max(0.0)));
             }
@@ -574,15 +1447,20 @@ pub fn apply_outpaint(img: &mut Rgb32f, ovl: &lightcraft_develop::CreativeOverla
     let right_pct = (ovl.expand_all + ovl.expand_right).clamp(0.0, 40.0) / 100.0;
     let fill_corners = ovl.fill_borders >= 0.5;
 
+    let mut p_state = DefaultHasher::new();
+    0x4F55_5450_5345_4544u64.hash(&mut p_state);
+    top_pct.to_bits().hash(&mut p_state);
+    bot_pct.to_bits().hash(&mut p_state);
+    left_pct.to_bits().hash(&mut p_state);
+    right_pct.to_bits().hash(&mut p_state);
+    fill_corners.hash(&mut p_state);
+    let param_seed = (p_state.finish() ^ 0x4F55_5450_2027).max(2);
+
     // Hash parameters + sparse image content fingerprint
     let mut h_state = DefaultHasher::new();
     w.hash(&mut h_state);
     h.hash(&mut h_state);
-    top_pct.to_bits().hash(&mut h_state);
-    bot_pct.to_bits().hash(&mut h_state);
-    left_pct.to_bits().hash(&mut h_state);
-    right_pct.to_bits().hash(&mut h_state);
-    fill_corners.hash(&mut h_state);
+    param_seed.hash(&mut h_state);
     let step = (img.data.len() / 96).max(1);
     for px in img.data.iter().step_by(step) {
         ((px[0] * 1024.0) as i32).hash(&mut h_state);
@@ -662,7 +1540,7 @@ pub fn apply_outpaint(img: &mut Rgb32f, ovl: &lightcraft_develop::CreativeOverla
 
     let cfg = LamaConfig {
         max_side: 1024,
-        seed: cache_key ^ 0x4F55_5450_2027,
+        seed: param_seed,
         iso: 0,
     };
     let out_flat = lightcraft_inpaint::outpaint_lama_borders(&canvas, &border_hole, w, h, &cfg);
@@ -807,6 +1685,46 @@ mod tests {
             }
         }
         assert!(err / n as f32 <= 0.08, "mean difference {}", err / n as f32);
+    }
+
+    #[test]
+    fn fill_zoom_in_and_out_reuses_inpaint_cache_across_resolutions() {
+        let spot = Spot {
+            mode: SpotMode::Fill,
+            points: vec![Point::new(0.48, 0.52), Point::new(0.54, 0.52)],
+            size: 0.09,
+            feather: 0.25,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let mut preview = striped_with_blot(320, 240, 16);
+        let fp = Frame::new(320, 240, &DevelopSettings::default(), true);
+        apply(&mut preview, std::slice::from_ref(&spot), &fp, fp.px_per_long(320));
+
+        // Zoom in to 2x resolution (640x480): should hit INPAINT_WORK_CACHE and match preview structure
+        let mut zoomed = striped_with_blot(640, 480, 32);
+        let fz = Frame::new(640, 480, &DevelopSettings::default(), true);
+        let t0 = std::time::Instant::now();
+        apply(&mut zoomed, std::slice::from_ref(&spot), &fz, fz.px_per_long(640));
+        let elapsed_zoom = t0.elapsed();
+        assert!(
+            elapsed_zoom.as_millis() < 80,
+            "zoomed inpaint should reuse INPAINT_WORK_CACHE quickly, took {:?}",
+            elapsed_zoom
+        );
+        let (mut err, mut n) = (0.0f32, 0);
+        for y in 110..135 {
+            for x in 145..175 {
+                let z_avg: f32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .iter()
+                    .map(|(dx, dy)| zoomed.get(2 * x + dx, 2 * y + dy)[0])
+                    .sum::<f32>()
+                    / 4.0;
+                err += (z_avg - preview.get(x, y)[0]).abs();
+                n += 1;
+            }
+        }
+        assert!(err / n as f32 <= 0.06, "zoom vs preview mean diff {}", err / n as f32);
     }
 
     #[test]

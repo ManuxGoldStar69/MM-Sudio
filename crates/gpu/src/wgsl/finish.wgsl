@@ -232,6 +232,16 @@ fn enc8(v: f32) -> u32 {
     return u32(clamp(v, 0.0, 1.0) * 255.0 + 0.5);
 }
 
+fn unpack_rgba(word: f32) -> vec4<f32> {
+    let u = bitcast<u32>(word);
+    return vec4<f32>(
+        f32(u & 0xffu) * (1.0 / 255.0),
+        f32((u >> 8u) & 0xffu) * (1.0 / 255.0),
+        f32((u >> 16u) & 0xffu) * (1.0 / 255.0),
+        min(f32((u >> 24u) & 0xffu) * (1.0 / 250.0), 1.0),
+    );
+}
+
 // sRGB-curve-encoded value → the output space's own curve (`OutputTrc`: 0 sRGB, 1 gamma, 2 Rec.709).
 fn out_encode(v: f32) -> f32 {
     let kind = pu(F_OUT_TRC);
@@ -498,6 +508,163 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             e = refine_saturation(e0, e, rs);
         }
     }
+    if (pu(F_SKY) != 0u) {
+        let fw = pf(F_VIG_VIEW + 2u);
+        let fh = pf(F_VIG_VIEW + 3u);
+        let nx = (pf(F_VIG_VIEW) + f32(x) + 0.5) / fw;
+        let ny = (pf(F_VIG_VIEW + 1u) + f32(y) + 0.5) / fh;
+        let sky_amt = pf(F_SKY_PARAMS);
+        let hor_y = pf(F_SKY_PARAMS + 1u);
+        let feather = pf(F_SKY_PARAMS + 2u);
+        let edge_ref = pf(F_SKY_PARAMS + 3u);
+        let relight = pf(F_SKY_PARAMS + 4u);
+        let haze = pf(F_SKY_PARAMS + 5u);
+        let w_shift = pf(F_SKY_PARAMS + 6u);
+        let exp_gain = pf(F_SKY_PARAMS + 7u);
+        let inv_sc = pf(F_SKY_PARAMS + 8u);
+        let sh_x = pf(F_SKY_PARAMS + 9u);
+        let sh_y = pf(F_SKY_PARAMS + 10u);
+        let hor_off = pf(F_SKY_PARAMS + 11u);
+
+        let r0 = clamp(e.x, 0.0, 1.0);
+        let g0 = clamp(e.y, 0.0, 1.0);
+        let b0 = clamp(e.z, 0.0, 1.0);
+        let lum_s = 0.2126 * r0 + 0.7152 * g0 + 0.0722 * b0;
+        let mx_s = max(r0, max(g0, b0));
+        let mn_s = min(r0, min(g0, b0));
+        let sat_s = (mx_s - mn_s) / max(mx_s, 1e-4);
+
+        // 1. Bilinearly sample the 640 × 480 RGB-guided neural sky matte
+        let mw = 640.0;
+        let mh = 480.0;
+        let mw_u = 640u;
+        let mfx = clamp(clamp(nx, 0.0, 1.0) * (mw - 1.0), 0.0, mw - 1.0001);
+        let mfy = clamp(clamp(ny, 0.0, 1.0) * (mh - 1.0), 0.0, mh - 1.0001);
+        let mx0 = u32(mfx);
+        let my0 = u32(mfy);
+        let mtx = mfx - f32(mx0);
+        let mty = mfy - f32(my0);
+        let mbase = pu(F_SKY_MATTE_OFF);
+        let m00 = aux[mbase + my0 * mw_u + mx0];
+        let m10 = aux[mbase + my0 * mw_u + mx0 + 1u];
+        let m01 = aux[mbase + (my0 + 1u) * mw_u + mx0];
+        let m11 = aux[mbase + (my0 + 1u) * mw_u + mx0 + 1u];
+        var coarse_matte = (m00 * (1.0 - mtx) + m10 * mtx) * (1.0 - mty) + (m01 * (1.0 - mtx) + m11 * mtx) * mty;
+        if (abs(hor_off) > 0.005) {
+            let user_v = 1.0 - sstep(hor_y - feather * 0.55, hor_y + feather * 0.55, ny);
+            coarse_matte = coarse_matte * user_v;
+        }
+
+        // 2. Native-resolution optical refinement along foliage, hair & horizon boundaries
+        let orig_sky = vec3<f32>(pf(F_SKY_ORIG), pf(F_SKY_ORIG + 1u), pf(F_SKY_ORIG + 2u));
+        let os_lum = max(0.2126 * orig_sky.x + 0.7152 * orig_sky.y + 0.0722 * orig_sky.z, 0.28);
+        var refined_matte = 0.0;
+        if (coarse_matte >= 0.995) {
+            refined_matte = 1.0;
+        } else if (coarse_matte > 0.002) {
+            let d_orig = length(vec3<f32>(r0, g0, b0) - orig_sky);
+            let sky_sim = 1.0 - sstep(0.04, 0.26, d_orig);
+            let dark_strand = 1.0 - sstep(0.18, 0.48, lum_s / os_lum);
+            let blend_k = 4.0 * coarse_matte * (1.0 - coarse_matte) * (0.55 + 0.45 * edge_ref);
+
+            var refined = max(coarse_matte, coarse_matte * 0.35 + sky_sim * 0.65 * sstep(0.08, 0.45, coarse_matte));
+            refined = refined * (1.0 - dark_strand * (1.0 - coarse_matte) * 0.45 * edge_ref);
+            let fine_det = l_pre - base_p[i];
+            let edge_delta = clamp(fine_det * 0.55, -0.24, 0.24) * edge_ref * blend_k;
+            refined_matte = clamp(refined + edge_delta, 0.0, 1.0);
+        }
+        let sky_alpha = clamp(refined_matte * sky_amt, 0.0, 1.0);
+
+        // 3. Sample the 4K (3840 × 2160) Nano Banana sky texture aligned to auto-detected horizon
+        var sky_rgb = vec3<f32>(0.0);
+        let hor_c = vec3<f32>(pf(F_SKY_HOR), pf(F_SKY_HOR + 1u), pf(F_SKY_HOR + 2u));
+        if (sky_alpha > 0.001 || coarse_matte > 0.005) {
+            var su = clamp((nx - 0.5 - sh_x) * inv_sc + 0.5, 0.0, 1.0);
+            if (pu(F_SKY_FLIP) != 0u) {
+                su = 1.0 - su;
+            }
+            let hor_denom = max(hor_y + 0.04, 0.22);
+            let sv = clamp(((ny - sh_y) / hor_denom - 0.5) * inv_sc + 0.5, 0.0, 0.985);
+
+            let sw = 3840.0;
+            let sh = 2160.0;
+            let sw_u = 3840u;
+            let sfx = clamp(su * (sw - 1.0), 0.0, sw - 1.0001);
+            let sfy = clamp(sv * (sh - 1.0), 0.0, sh - 1.0001);
+            let sx0 = u32(sfx);
+            let sy0 = u32(sfy);
+            let stx = sfx - f32(sx0);
+            let sty = sfy - f32(sy0);
+            let sbase = pu(F_SKY_OFF);
+            let p00 = unpack_rgba(aux[sbase + sy0 * sw_u + sx0]).xyz;
+            let p10 = unpack_rgba(aux[sbase + sy0 * sw_u + sx0 + 1u]).xyz;
+            let p01 = unpack_rgba(aux[sbase + (sy0 + 1u) * sw_u + sx0]).xyz;
+            let p11 = unpack_rgba(aux[sbase + (sy0 + 1u) * sw_u + sx0 + 1u]).xyz;
+            let raw_sky = (p00 * (1.0 - stx) + p10 * stx) * (1.0 - sty) + (p01 * (1.0 - stx) + p11 * stx) * sty;
+            sky_rgb = clamp(
+                vec3<f32>(
+                    raw_sky.x * (1.0 + 0.24 * w_shift) * exp_gain,
+                    raw_sky.y * (1.0 + 0.04 * w_shift) * exp_gain,
+                    raw_sky.z * (1.0 - 0.24 * w_shift) * exp_gain,
+                ),
+                vec3<f32>(0.0),
+                vec3<f32>(1.0),
+            );
+            let t_hor = sstep(hor_y - feather * 0.90, hor_y + 0.04, ny);
+            let mist_w = clamp(t_hor * (0.18 + 0.42 * haze), 0.0, 0.68);
+            sky_rgb = sky_rgb * (1.0 - mist_w) + hor_c * mist_w;
+        }
+
+        // 4. Optical Foreground Color Decontamination (Un-Premultiplying Old Sky Glare / Defringe)
+        var fg = vec3<f32>(r0, g0, b0);
+        if (refined_matte > 0.003 && refined_matte < 0.998) {
+            var local_boost = 1.0;
+            if (sat_s < 0.16 && lum_s > os_lum) {
+                local_boost = lum_s / os_lum;
+            }
+            let spill = min(refined_matte * (0.85 + 0.15 * edge_ref), 0.94);
+            let inv_rem = 1.0 / max(1.0 - spill, 0.06);
+            let os_eff = min(orig_sky * local_boost, vec3<f32>(0.99));
+            fg = clamp((fg - spill * os_eff) * inv_rem, vec3<f32>(0.0), fg);
+
+            let fg_lum = 0.2126 * fg.x + 0.7152 * fg.y + 0.0722 * fg.z;
+            let bokeh_edge = 4.0 * refined_matte * (1.0 - refined_matte);
+            let rim_factor = max(bokeh_edge, sstep(0.15, 0.75, refined_matte) * (1.0 - sat_s * 0.8));
+            let bloom_harmonize = clamp(rim_factor * (0.48 + 0.42 * edge_ref) * sky_amt, 0.0, 0.85);
+            let rel_lum = clamp(fg_lum / os_lum, 0.16, 1.0);
+            let target_fg = max(sky_rgb * rel_lum, min(fg, sky_rgb));
+            fg = fg * (1.0 - bloom_harmonize) + target_fg * bloom_harmonize;
+        }
+
+        // 5. Skin-safe & white-garment-safe Foreground Relighting
+        let fg_weight = (1.0 - sky_alpha) * relight;
+        if (fg_weight > 0.01) {
+            let white_protect = sstep(0.52, 0.76, lum_s) * (1.0 - sstep(0.08, 0.22, sat_s));
+            var skin_protect = 0.0;
+            if (r0 > g0 && g0 > b0) {
+                skin_protect = sstep(0.03, 0.12, r0 - b0) * sstep(0.20, 0.40, lum_s) * (1.0 - sstep(0.78, 0.92, lum_s));
+            }
+            let protect = max(white_protect, skin_protect * 0.85);
+            let cat_id = pu(F_SKY_CAT);
+            var chroma_str = 0.12;
+            if (cat_id >= 4u) {
+                chroma_str = 0.46;
+            }
+            let amb = vec3<f32>(pf(F_SKY_AMB), pf(F_SKY_AMB + 1u), pf(F_SKY_AMB + 2u));
+            let amb_lum = 0.2126 * amb.x + 0.7152 * amb.y + 0.0722 * amb.z;
+            var lum_scale = clamp(0.90 + 0.22 * amb_lum, 0.86, 1.06);
+            if (cat_id == 4u) {
+                lum_scale = clamp(0.78 + 0.42 * amb_lum, 0.70, 1.02);
+            }
+            let tone_env = 0.30 + 0.70 * clamp(1.0 - abs(lum_s - 0.45) * 1.5, 0.0, 1.0);
+            let relight_k = fg_weight * tone_env * (1.0 - protect * 0.88) * 0.38;
+            let amb_c = vec3<f32>(amb_lum) + (amb - vec3<f32>(amb_lum)) * chroma_str;
+            let tinted = fg * lum_scale * (vec3<f32>(0.74) + amb_c * 0.52);
+            fg = clamp(fg * (1.0 - relight_k) + tinted * relight_k, vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+
+        e = clamp(fg * (1.0 - sky_alpha) + sky_rgb * sky_alpha, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     if (pu(F_OVL) != 0u) {
         let fw = pf(F_VIG_VIEW + 2u);
         let fh = pf(F_VIG_VIEW + 3u);
@@ -510,6 +677,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sh_x = pf(F_OVL_PARAMS + 4u);
         let sh_y = pf(F_OVL_PARAMS + 5u);
         let prot_c = pf(F_OVL_PARAMS + 6u);
+        let w_sh = pf(F_OVL_PARAMS + 7u);
         let dx = nx - 0.5 - sh_x;
         let dy = ny - 0.5 - sh_y;
         let rx = (dx * cos_a + dy * sin_a) * inv_sc;
@@ -524,50 +692,84 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if ((flip & 2u) != 0u) {
                 v = 1.0 - v;
             }
-            let side = 192.0;
-            let side_u = 192u;
-            let fx = clamp(u * (side - 1.0), 0.0, side - 1.0001);
-            let fy = clamp(v * (side - 1.0), 0.0, side - 1.0001);
+            let ow_u = pu(F_OVL_W);
+            let oh_u = pu(F_OVL_H);
+            let ow = f32(ow_u);
+            let oh = f32(oh_u);
+            let fx = clamp(u * (ow - 1.0), 0.0, ow - 1.0001);
+            let fy = clamp(v * (oh - 1.0), 0.0, oh - 1.0001);
             let x0 = u32(fx);
             let y0 = u32(fy);
             let tx = fx - f32(x0);
             let ty = fy - f32(y0);
             let base = pu(F_OVL_OFF);
-            let i00 = base + (y0 * side_u + x0) * 3u;
-            let i10 = base + (y0 * side_u + x0 + 1u) * 3u;
-            let i01 = base + ((y0 + 1u) * side_u + x0) * 3u;
-            let i11 = base + ((y0 + 1u) * side_u + x0 + 1u) * 3u;
-            var ov = vec3<f32>(0.0);
-            for (var c_i = 0u; c_i < 3u; c_i++) {
-                let top = aux[i00 + c_i] * (1.0 - tx) + aux[i10 + c_i] * tx;
-                let bot = aux[i01 + c_i] * (1.0 - tx) + aux[i11 + c_i] * tx;
-                ov[c_i] = sqrt(max(top * (1.0 - ty) + bot * ty, 0.0));
-            }
+            let p00 = unpack_rgba(aux[base + y0 * ow_u + x0]);
+            let p10 = unpack_rgba(aux[base + y0 * ow_u + x0 + 1u]);
+            let p01 = unpack_rgba(aux[base + (y0 + 1u) * ow_u + x0]);
+            let p11 = unpack_rgba(aux[base + (y0 + 1u) * ow_u + x0 + 1u]);
+            let rgba = (p00 * (1.0 - tx) + p10 * tx) * (1.0 - ty) + (p01 * (1.0 - tx) + p11 * tx) * ty;
+
             let cd = sqrt((nx - 0.5) * (nx - 0.5) + (ny - 0.5) * (ny - 0.5)) * 2.0;
             let protect = 1.0 - prot_c * 0.82 * (1.0 - sstep(0.18, 0.85, cd));
             let k = clamp(ovl_amt * protect, 0.0, 1.0);
-            if (k > 1e-4) {
+            let ov_a = clamp(rgba.w, 0.0, 1.0);
+            if (k > 1e-4 && ov_a > 1e-4) {
+                let ov_rgb = clamp(
+                    vec3<f32>(
+                        rgba.x * (1.0 + 0.25 * w_sh),
+                        rgba.y * (1.0 + 0.04 * w_sh),
+                        rgba.z * (1.0 - 0.25 * w_sh),
+                    ),
+                    vec3<f32>(0.0),
+                    vec3<f32>(1.0),
+                );
+                let mode = pu(F_OVL_MODE);
                 let blend_m = pu(F_OVL_BLEND);
-                for (var c_i = 0u; c_i < 3u; c_i++) {
-                    let b_v = clamp(e[c_i], 0.0, 1.0);
-                    let s_v = clamp(ov[c_i] * k, 0.0, 1.2);
-                    let s_m = min(s_v, 1.0);
-                    var res = b_v;
-                    if (blend_m == 0u) {
-                        res = 1.0 - (1.0 - b_v) * (1.0 - s_m);
-                    } else if (blend_m == 1u) {
-                        let sl = (1.0 - 2.0 * s_m) * b_v * b_v + 2.0 * s_m * b_v;
-                        res = b_v + (sl - b_v) * 0.85 + s_v * 0.35;
-                    } else if (blend_m == 2u) {
-                        res = min(b_v + s_v * 0.90, 1.0);
-                    } else {
-                        var ov_b = 2.0 * b_v * s_m;
-                        if (b_v >= 0.5) {
-                            ov_b = 1.0 - 2.0 * (1.0 - b_v) * (1.0 - s_m);
+                if (mode == 1u) {
+                    let a = clamp(ov_a * k, 0.0, 1.0);
+                    for (var c_i = 0u; c_i < 3u; c_i++) {
+                        let b_v = clamp(e[c_i], 0.0, 1.0);
+                        let fg_c = ov_rgb[c_i];
+                        var res = b_v;
+                        if (blend_m == 0u) {
+                            res = b_v * (1.0 - a) + fg_c * a;
+                        } else if (blend_m == 1u) {
+                            let sl = (1.0 - 2.0 * fg_c) * b_v * b_v + 2.0 * fg_c * b_v;
+                            res = b_v * (1.0 - a) + (fg_c * 0.35 + sl * 0.65) * a;
+                        } else if (blend_m == 2u) {
+                            res = min(b_v + fg_c * a * 0.90, 1.0);
+                        } else {
+                            var ov_b = 2.0 * b_v * fg_c;
+                            if (b_v >= 0.5) {
+                                ov_b = 1.0 - 2.0 * (1.0 - b_v) * (1.0 - fg_c);
+                            }
+                            res = b_v * (1.0 - a) + (fg_c * 0.45 + ov_b * 0.55) * a;
                         }
-                        res = b_v * (1.0 - k * 0.65) + ov_b * (k * 0.65) + s_v * 0.25;
+                        e[c_i] = clamp(res, 0.0, 1.0);
                     }
-                    e[c_i] = clamp(res, 0.0, 1.0);
+                } else {
+                    for (var c_i = 0u; c_i < 3u; c_i++) {
+                        let b_v = clamp(e[c_i], 0.0, 1.0);
+                        let s_v = clamp(ov_rgb[c_i] * ov_a * k, 0.0, 1.2);
+                        let s_m = min(s_v, 1.0);
+                        var res = b_v;
+                        if (blend_m == 0u) {
+                            res = 1.0 - (1.0 - b_v) * (1.0 - s_m);
+                        } else if (blend_m == 1u) {
+                            let sl = (1.0 - 2.0 * s_m) * b_v * b_v + 2.0 * s_m * b_v;
+                            res = b_v + (sl - b_v) * 0.85 + s_v * 0.35;
+                        } else if (blend_m == 2u) {
+                            res = min(b_v + s_v * 0.90, 1.0);
+                        } else {
+                            var ov_b = 2.0 * b_v * s_m;
+                            if (b_v >= 0.5) {
+                                ov_b = 1.0 - 2.0 * (1.0 - b_v) * (1.0 - s_m);
+                            }
+                            let ok = k * ov_a * 0.65;
+                            res = b_v * (1.0 - ok) + ov_b * ok + s_v * 0.25;
+                        }
+                        e[c_i] = clamp(res, 0.0, 1.0);
+                    }
                 }
             }
         }

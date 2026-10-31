@@ -1,11 +1,12 @@
 //! The settings a print is made from, and (with the saved-template commands) what a print
 //! template stores.
 use super::PrintJob;
+use super::book::BookSettings;
 use super::compose::{ImageSettings, PageStyle};
 use super::layout::{Guides, Layout};
 use serde::{Deserialize, Serialize};
 
-/// Layout, image settings, page, guides and job: the whole Print module state.
+/// Layout, image settings, page, guides, job and photobook configuration: the whole Print module state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct PrintSettings {
@@ -14,6 +15,8 @@ pub struct PrintSettings {
     pub page: PageStyle,
     pub guides: Guides,
     pub job: PrintJob,
+    #[serde(default, skip_serializing_if = "BookSettings::is_default")]
+    pub book: BookSettings,
 }
 
 impl PrintSettings {
@@ -22,6 +25,7 @@ impl PrintSettings {
         self.layout.validate()?;
         self.image.validate()?;
         self.guides.validate()?;
+        self.book.validate()?;
         self.job.validate()
     }
 }

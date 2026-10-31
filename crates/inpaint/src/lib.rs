@@ -22,9 +22,12 @@ pub mod lama;
 pub mod membrane;
 pub mod patchmatch;
 
-pub use lama::{LamaConfig, inpaint_lama_box, local_onnx_model_path, outpaint_lama_borders, run_lama_onnx_512};
+pub use lama::{
+    LamaConfig, current_cloud_mode_tag, inpaint_lama_box, is_cloud_seed_cached, local_onnx_model_path,
+    outpaint_lama_borders, run_lama_onnx_512,
+};
 pub use membrane::membrane_fill;
-pub use patchmatch::{CompleteParams, complete, complete_with};
+pub use patchmatch::{CompleteParams, complete, complete_guided_nnf, complete_with};
 
 /// A cancelled [`complete_with`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

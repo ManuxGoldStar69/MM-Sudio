@@ -3,6 +3,7 @@
 //! [`layout`] is the pure page model (paper, margins, cells); [`compose`] renders a layout and its
 //! photos to [`PageRaster`]s; [`template`] holds the saved settings; [`output`] writes the pages
 //! as a PDF.
+pub mod book;
 pub mod compose;
 pub mod layout;
 pub mod output;

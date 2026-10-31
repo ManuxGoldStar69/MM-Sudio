@@ -62,7 +62,17 @@ impl SettingsHashes {
 }
 
 /// Bump when the pipeline's output changes, to invalidate cached thumbnails.
-pub const RENDER_CACHE_VERSION: u64 = 69;
+pub const RENDER_CACHE_VERSION: u64 = 71;
+
+fn ai_spot_salt(settings: &DevelopSettings) -> u64 {
+    if settings.spots.is_empty() && !settings.overlay.has_outpaint() {
+        return 0;
+    }
+    let (cloud_on, mode_tag) = lightcraft_pipeline::current_cloud_mode_tag();
+    let mut h = Hasher128::new();
+    h.str("ai_spot_v3").u64(cloud_on as u64).u64(mode_tag);
+    (h.finish().0 as u64).max(1)
+}
 
 /// Thumbnails render at one of these long edges (so window/cell size changes reuse the cache).
 pub const THUMB_SIZES: [usize; 4] = [128, 256, 384, 512];
@@ -1293,7 +1303,7 @@ impl crate::Session {
         let content = source_key.0 as u64;
         // Temporary "before" settings must not replace the photo's cached develop hash.
         let settings_hash = if before { settings.hash64() } else { self.media.settings_hashes.get(id, &settings) };
-        let salt = self.media.denoise_salt(id, &settings);
+        let salt = self.media.denoise_salt(id, &settings) ^ if before { 0 } else { ai_spot_salt(&settings) };
         let key = settings_hash
             ^ ((max_w as u64) << 40)
             ^ ((max_h as u64) << 20)
@@ -1464,6 +1474,7 @@ impl crate::Session {
             .str(&content_key(p))
             .str("view")
             .u64(p.develop.hash64())
+            .u64(ai_spot_salt(&p.develop))
             .u64(apply_crop as u64)
             .u64(RENDER_CACHE_VERSION)
             .u64(crate::camera_profiles::cache_key())
@@ -1585,7 +1596,13 @@ impl crate::Session {
         let small = self.thumb_job(id, THUMB_SIZES[THUMB_SIZES.len() - 1])?;
         // (the thumbnail job itself starts with the cached thumbnail, after the sharper embedded preview)
         let cached = vec![(self.media.rendered.clone(), Self::view_key(&p, apply_crop))];
-        let h = Hasher128::new().str(&content_key(&p)).str("quick").u64(p.develop.hash64()).u64(apply_crop as u64).finish();
+        let h = Hasher128::new()
+            .str(&content_key(&p))
+            .str("quick")
+            .u64(p.develop.hash64())
+            .u64(ai_spot_salt(&p.develop))
+            .u64(apply_crop as u64)
+            .finish();
         let key = h.0 as u64;
         let embedded = self.embedded_of(&p).map(|(path, l)| (path, l, max_edge.clamp(1, SourceLevel::Preview.max_edge())));
         Some(QuickJob { request_id: 0, photo: id, key, cached, embedded, small: apply_crop.then(|| Box::new(small)) })

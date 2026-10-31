@@ -939,7 +939,10 @@ pub fn specs() -> Vec<CommandSpec> {
                 };
                 let id = s.active().ok_or_else(|| bad("spot.add", "no active photo"))?;
                 let mut dd = (*s.develop_of(id).unwrap_or_default()).clone();
-                if spot.source_offset.is_none() && spot.mode != SpotMode::Fill {
+                if spot.source_offset.is_none()
+                    && spot.mode != SpotMode::Fill
+                    && !(spot.mode == SpotMode::Remove && spot.points.len() >= 2)
+                {
                     // resolve the automatic source now: it gets a pin and stays put at every size
                     spot.source_offset = pick_source(s, id, &dd, &spot, None);
                 }
@@ -1016,9 +1019,18 @@ pub fn specs() -> Vec<CommandSpec> {
                 let id = s.active().ok_or_else(|| bad(c, "no active photo"))?;
                 let dd = (*s.develop_of(id).unwrap_or_default()).clone();
                 let spot = dd.spots[i].clone();
-                let next = pick_source(s, id, &dd, &spot, spot.source_offset).ok_or_else(|| bad(c, "no other source fits in the photo"))?;
+                let is_ai_fill = spot.mode == SpotMode::Fill || (spot.mode == SpotMode::Remove && spot.points.len() >= 12);
+                let next = if is_ai_fill {
+                    let prev = spot.source_offset.unwrap_or(Point::new(0.0, 0.0));
+                    Point::new((prev.x + 0.0137) % 1.0, (prev.y + 0.0293) % 1.0)
+                } else {
+                    pick_source(s, id, &dd, &spot, spot.source_offset).ok_or_else(|| bad(c, "no other source fits in the photo"))?
+                };
                 spots_edit(s, c, "Refresh Source", |spots| {
                     spots[i].source_offset = Some(next);
+                    if is_ai_fill {
+                        spots[i].mode = SpotMode::Fill;
+                    }
                     Ok(())
                 })?;
                 Ok(json!({"index": i, "source": [next.x, next.y]}))

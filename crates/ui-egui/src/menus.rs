@@ -301,7 +301,13 @@ fn adjust_brush(app: &mut LightcraftApp, k: f32, df: f32) -> Value {
     if app.ui.right == RightPanel::Remove {
         app.ui.remove_size = (app.ui.remove_size * k).clamp(0.001, 0.25);
         app.ui.remove_feather = (app.ui.remove_feather + df).clamp(0.0, 100.0);
-        if app.session.active_spot.is_some() {
+        let is_fill_spot = app.session.active_spot.is_some_and(|idx| {
+            app.session
+                .active()
+                .and_then(|id| app.session.develop_of(id))
+                .is_some_and(|d| d.spots.get(idx).is_some_and(|s| s.mode == lightcraft_develop::SpotMode::Fill))
+        });
+        if app.session.active_spot.is_some() && !is_fill_spot {
             let mut p = json!({});
             if k != 1.0 {
                 p["size"] = json!(app.ui.remove_size);
@@ -1467,6 +1473,66 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 params["path"] = json!(path);
             }
             crate::export_task::start_print(app, &params)
+        }
+        "app.saveMmbook" => {
+            if app.export.is_some() {
+                return Some(Err("an export is already running".into()));
+            }
+            let mut params = p.clone();
+            if p.get("path").is_none() {
+                let req = PickRequest::save(
+                    "Guardar Proyecto de Imprenta (.mmbook)",
+                    "Proyecto MM Studio Photobook (.mmbook)",
+                    &["mmbook"],
+                    "Proyecto_Fotolibro.mmbook",
+                );
+                let paths = match crate::pick::ask(app, id, p, "path", req, |_| None) {
+                    Picked::Now(paths) => paths,
+                    Picked::Later => return Some(Ok(Value::Null)),
+                    Picked::Unavailable => return Some(Err("no save dialog on this platform; supply path".into())),
+                };
+                let Some(path) = paths.first() else { return Some(Ok(Value::Null)) };
+                params["path"] = json!(path);
+            }
+            crate::export_task::start_save_mmbook(app, &params)
+        }
+        "app.openMmbook" => {
+            let path = match p.get("path").and_then(Value::as_str) {
+                Some(x) => x.to_string(),
+                None => {
+                    let req = PickRequest::file(
+                        "Abrir Proyecto de Imprenta (.mmbook)",
+                        "Proyecto MM Studio Photobook (.mmbook)",
+                        &["mmbook"],
+                    );
+                    match crate::pick::ask(app, id, p, "path", req, |s| s.pick_files.as_mut().map(|f| f())) {
+                        Picked::Now(v) => match v.into_iter().next() {
+                            Some(x) => x,
+                            None => return Some(Ok(Value::Null)),
+                        },
+                        Picked::Later => return Some(Ok(Value::Null)),
+                        Picked::Unavailable => return Some(Err("no file dialog on this platform; supply path".into())),
+                    }
+                }
+            };
+            let r = app.session.execute("print.open_project", &json!({"path": path})).map_err(|e| e.to_string());
+            match &r {
+                Ok(v) => {
+                    app.ui.print.page = 0;
+                    app.ui.print.selected = None;
+                    app.ui.dialog = Some(Dialog::Print);
+                    let title = v["title"].as_str().unwrap_or("Fotolibro");
+                    let n = v["importedPhotos"].as_u64().unwrap_or(0);
+                    let spreads = v["spreads"].as_u64().unwrap_or(1);
+                    app.toast_for(
+                        &ctx,
+                        format!("📂 Proyecto cargado: “{title}” ({n} fotos a 300 DPI · {spreads} pliegos listos para imprenta)"),
+                        5.0,
+                    );
+                }
+                Err(e) => app.toast_error(&ctx, e.clone()),
+            }
+            r
         }
         "app.contactSheet" => {
             if app.export.is_some() {

@@ -1,16 +1,24 @@
-//! High-resolution optical & atmospheric Overlays (5 categories × 30 presets = 150 overlays).
+//! High-resolution optical & atmospheric Overlays (200 presets across 9 categories).
 //!
-//! Each overlay is synthesized into a cached `OVL_SIDE × OVL_SIDE` linear RGB field and sampled
-//! bilinearly in both the CPU per-pixel stage (`finish.rs`) and the GPU compute kernel
-//! (`finish.wgsl`) so interactive placement, rotation, scaling, and blending run at 60 FPS with
-//! CPU/GPU parity.
+//! Presets `151..=200` (Pájaros Volando, Arcoíris, Sol y Resplandor, Nubes) are powered by 4K UHD
+//! (`3840 × 2160`) Nano Banana photographic master plates packed as RGBA8 `u32` words.
+//! Presets `1..=150` (Light Leaks, Bokeh, Sunbeams, Prism, Cinema/Weather) are synthesized at
+//! `512 × 512` and packed into the same RGBA8 `u32` format for 60 FPS CPU & GPU parity.
 
 use std::sync::{Arc, LazyLock, Mutex};
 
 use lightcraft_develop::CreativeOverlay;
 
-/// Resolution of the pre-baked optical overlay map per axis (`192 × 192 × 3` floats).
-pub const OVL_SIDE: usize = 192;
+use crate::nano_banana::{
+    box_blur_packed_rgba8, build_nature_overlay_packed_map, pack_rgba8_f32, unpack_rgba8_f32,
+};
+
+/// Native 4K UHD dimensions (`3840 × 2160`) for the 50 Nano Banana Nature Overlays (`151..=200`).
+pub const OVL_4K_W: usize = 3840;
+pub const OVL_4K_H: usize = 2160;
+
+/// Resolution of the pre-baked optical overlay map per axis (`512 × 512` packed RGBA8 words) for `1..=150`.
+pub const OVL_SIDE: usize = 512;
 
 /// Category of an optical overlay in the Effects -> Overlays sub-area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,15 +28,23 @@ pub enum OverlayCategory {
     Sunbeams,
     Prism,
     CinemaWeather,
+    Birds,
+    Rainbows,
+    SunGlow,
+    Clouds,
 }
 
 impl OverlayCategory {
-    pub const ALL: [OverlayCategory; 5] = [
+    pub const ALL: [OverlayCategory; 9] = [
         OverlayCategory::LightLeaks,
         OverlayCategory::Bokeh,
         OverlayCategory::Sunbeams,
         OverlayCategory::Prism,
         OverlayCategory::CinemaWeather,
+        OverlayCategory::Birds,
+        OverlayCategory::Rainbows,
+        OverlayCategory::SunGlow,
+        OverlayCategory::Clouds,
     ];
 
     pub fn id(self) -> &'static str {
@@ -38,6 +54,10 @@ impl OverlayCategory {
             Self::Sunbeams => "sunbeams",
             Self::Prism => "prism",
             Self::CinemaWeather => "cinema",
+            Self::Birds => "birds",
+            Self::Rainbows => "rainbows",
+            Self::SunGlow => "sunglow",
+            Self::Clouds => "clouds",
         }
     }
 
@@ -48,6 +68,10 @@ impl OverlayCategory {
             Self::Sunbeams => "☀️ Rayos y Atmósfera",
             Self::Prism => "💎 Prisma y Halación",
             Self::CinemaWeather => "🎬 Anamórfico y Clima",
+            Self::Birds => "🕊️ Pájaros Volando",
+            Self::Rainbows => "🌈 Arcoíris",
+            Self::SunGlow => "🌞 Sol y Resplandor",
+            Self::Clouds => "☁️ Nubes",
         }
     }
 }
@@ -55,7 +79,7 @@ impl OverlayCategory {
 /// Metadata for a single overlay card in the UI carousel.
 #[derive(Clone, Debug)]
 pub struct OverlaySpec {
-    /// 1-based preset index (`1..=150`).
+    /// 1-based preset index (`1..=200`).
     pub index: u16,
     pub id: String,
     pub name: String,
@@ -69,13 +93,13 @@ pub struct OverlaySpec {
 
 static CATALOG: LazyLock<Vec<OverlaySpec>> = LazyLock::new(build_catalog);
 
-/// Returns the full catalog of 150 optical overlays (30 per category).
+/// Returns the full catalog of 200 optical & atmospheric overlays.
 pub fn catalog() -> &'static [OverlaySpec] {
     &CATALOG
 }
 
 fn build_catalog() -> Vec<OverlaySpec> {
-    let mut out = Vec::with_capacity(150);
+    let mut out = Vec::with_capacity(200);
 
     let leaks_names: [(&str, &str, [u8; 3], [u8; 3]); 30] = [
         ("Kodak Gold Burn", "Fuga cálida lateral de película 35mm", [255, 138, 48], [214, 52, 30]),
@@ -242,12 +266,78 @@ fn build_catalog() -> Vec<OverlaySpec> {
         ("Grand Finale Sparkles", "Destellos estelares y trazos de gala", [255, 216, 128], [168, 212, 255]),
     ];
 
-    let groups: [(OverlayCategory, &[(&str, &str, [u8; 3], [u8; 3]); 30]); 5] = [
+    let birds_names: [(&str, &str, [u8; 3], [u8; 3]); 10] = [
+        ("Bandada en V", "Vuelo alto en formación clásica", [58, 66, 84], [148, 168, 198]),
+        ("Gaviotas al Sol", "Aves costeras al contraluz dorado", [255, 214, 142], [118, 92, 68]),
+        ("Palomas Nupciales", "Vuelo romántico blanco para bodas", [248, 250, 255], [198, 212, 236]),
+        ("Aves del Horizonte", "Siluetas lejanas minimalistas", [48, 56, 72], [128, 142, 168]),
+        ("Bandada Ascendente", "Vuelo dinámico en diagonal", [62, 70, 88], [164, 178, 204]),
+        ("Dúo en Libertad", "Pareja de aves planeando juntas", [52, 60, 78], [142, 156, 184]),
+        ("Vuelo de Atardecer", "Siluetas cálidas en hora dorada", [96, 58, 48], [244, 168, 96]),
+        ("Cielo de Golondrinas", "Dispersión natural de aves rápidas", [56, 64, 82], [138, 152, 178]),
+        ("Águila en Cumbre", "Planeo solitario majestuoso", [44, 50, 64], [124, 138, 162]),
+        ("Gran Migración", "Bandada amplia cruzando el cielo", [60, 68, 86], [156, 172, 198]),
+    ];
+
+    let rainbows_names: [(&str, &str, [u8; 3], [u8; 3]); 10] = [
+        ("Arcoíris Real", "Arco espectral completo de 7 bandas", [255, 118, 128], [108, 196, 255]),
+        ("Arcoíris Doble", "Arco primario y secundario invertido", [255, 134, 118], [124, 212, 255]),
+        ("Arcoíris Nupcial", "Tonos pastel suaves para bodas", [255, 168, 184], [152, 224, 248]),
+        ("Arco en la Bruma", "Arcoíris atmosférico entre neblina", [255, 152, 142], [138, 214, 238]),
+        ("Puente Celestial", "Gran bóveda cromática de horizonte", [255, 128, 112], [98, 188, 255]),
+        ("Arcoíris Hora Dorada", "Arco cálido bañado por sol de tarde", [255, 164, 96], [134, 208, 232]),
+        ("Destello Tras Lluvia", "Rama derecha intensa y luminosa", [255, 112, 124], [88, 204, 255]),
+        ("Brisa Irisada", "Rama izquierda suave entre nubes", [255, 144, 156], [118, 218, 248]),
+        ("Arcoíris Alpino", "Pureza cromática de alta montaña", [255, 108, 118], [78, 192, 255]),
+        ("Fragmento Espectral", "Destello localizado de nube irisada", [255, 158, 176], [136, 228, 244]),
+    ];
+
+    let sunglow_names: [(&str, &str, [u8; 3], [u8; 3]); 10] = [
+        ("Sol Dorado Real", "Disco solar brillante con corona cálida", [255, 226, 148], [248, 152, 58]),
+        ("Estrella Solar 8P", "Sol con difracción óptica de 8 puntas", [255, 236, 178], [242, 168, 74]),
+        ("Sol de Atardecer", "Esfera ámbar profunda en horizonte", [255, 184, 88], [238, 96, 42]),
+        ("Sol Matutino Puro", "Luz blanca cálida de amanecer limpio", [255, 244, 214], [248, 198, 124]),
+        ("Resplandor Épico", "Gran halo solar envolvente de cine", [255, 212, 122], [244, 134, 48]),
+        ("Sol entre Nubes", "Núcleo radiante con corona atmosférica", [255, 232, 168], [236, 164, 82]),
+        ("Sol Diamante 14P", "Estrella de 14 puntas de lente cerrada", [255, 242, 196], [238, 176, 96]),
+        ("Sol Californiano", "Brillo melocotón y oro suave", [255, 204, 142], [244, 128, 78]),
+        ("Sol Cenital", "Disco luminoso alto de mediodía", [255, 246, 208], [238, 194, 118]),
+        ("Sol Crepuscular", "Resplandor carmesí y oro encendido", [255, 168, 92], [232, 74, 58]),
+    ];
+
+    let clouds_names: [(&str, &str, [u8; 3], [u8; 3]); 20] = [
+        ("Cúmulos de Verano", "Nubes esponjosas blancas iluminadas", [248, 250, 255], [188, 204, 228]),
+        ("Nubes de Boda", "Velo nuboso etéreo y delicado", [255, 252, 248], [212, 218, 232]),
+        ("Cirros Pluma", "Pinceladas altas de viento suave", [242, 246, 255], [178, 198, 226]),
+        ("Cúmulos Dorados", "Nubes con borde cálido de atardecer", [255, 224, 176], [214, 152, 118]),
+        ("Banco de Niebla", "Niebla baja volumétrica de valle", [238, 244, 250], [184, 196, 214]),
+        ("Nubes Escultóricas", "Cúmulos densos de alto volumen", [252, 252, 255], [168, 184, 212]),
+        ("Algodón Rosado", "Nubes pastel de hora mágica", [255, 208, 214], [212, 164, 196]),
+        ("Bruma de Montaña", "Capas nubosas alpinas flotantes", [244, 248, 255], [182, 198, 222]),
+        ("Altocúmulos Suaves", "Manto de nubes medias texturizadas", [246, 248, 254], [176, 192, 218]),
+        ("Nube Solitaria", "Acento nuboso suave superior", [250, 252, 255], [192, 208, 232]),
+        ("Velo de Cirros", "Textura sedosa de cielo alto", [240, 246, 255], [174, 194, 224]),
+        ("Nubes de Tormenta Luz", "Contraste dramático plata y sol", [236, 240, 248], [138, 152, 178]),
+        ("Franja de Horizonte", "Banda de nubes bajas lejanas", [248, 246, 242], [196, 198, 212]),
+        ("Contraluz Plateado", "Nubes con halo brillante de plata", [255, 255, 255], [184, 198, 220]),
+        ("Brisa de Cúmulos", "Nubes dispersas de buen tiempo", [248, 252, 255], [186, 206, 234]),
+        ("Neblina Costera", "Suavidad marina difusa y limpia", [242, 248, 252], [188, 204, 218]),
+        ("Nubes Crepusculares", "Tonos ámbar, coral y lavanda", [255, 192, 148], [168, 138, 192]),
+        ("Marco de Nubes", "Arco superior de nubes suaves", [250, 252, 255], [188, 202, 226]),
+        ("Corriente de Viento", "Estelas largas y fluidas en altura", [244, 248, 255], [178, 196, 224]),
+        ("Cielo Celestial", "Manto glorioso de nubes iluminadas", [255, 248, 236], [204, 212, 232]),
+    ];
+
+    let groups: [(OverlayCategory, &[(&str, &str, [u8; 3], [u8; 3])]); 9] = [
         (OverlayCategory::LightLeaks, &leaks_names),
         (OverlayCategory::Bokeh, &bokeh_names),
         (OverlayCategory::Sunbeams, &sunbeam_names),
         (OverlayCategory::Prism, &prism_names),
         (OverlayCategory::CinemaWeather, &cinema_names),
+        (OverlayCategory::Birds, &birds_names),
+        (OverlayCategory::Rainbows, &rainbows_names),
+        (OverlayCategory::SunGlow, &sunglow_names),
+        (OverlayCategory::Clouds, &clouds_names),
     ];
 
     let mut idx = 1u16;
@@ -293,49 +383,57 @@ fn hash_u32(mut x: u32) -> f32 {
     (x & 0x00ff_ffff) as f32 / 16_777_215.0
 }
 
-#[inline]
-fn rotate_rgb_warmth(rgb: [f32; 3], warmth: f32) -> [f32; 3] {
-    if warmth.abs() < 1e-4 {
-        return rgb;
-    }
-    let w = (warmth / 100.0).clamp(-1.0, 1.0);
-    let r = (rgb[0] * (1.0 + 0.35 * w) + rgb[1] * (0.08 * w.max(0.0))).max(0.0);
-    let g = (rgb[1] * (1.0 + 0.05 * w)).max(0.0);
-    let b = (rgb[2] * (1.0 - 0.35 * w) + rgb[1] * (0.12 * (-w).max(0.0))).max(0.0);
-    [r, g, b]
-}
-
-type CacheEntry = ((u16, i32, i32), Arc<Vec<f32>>);
+type CachedOvl = (Arc<Vec<f32>>, u32, u32, u32);
+type CacheEntry = ((u16, i32), CachedOvl);
 
 static MAP_CACHE: LazyLock<Mutex<Vec<CacheEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Returns the cached `OVL_SIDE × OVL_SIDE × 3` linear RGB field for `preset` (`1..=150`),
-/// adjusted by `warmth` (`-100..100`) and optical `blur` (`0..100`).
-pub fn overlay_map_cached(preset: u16, warmth: f64, blur: f64) -> Option<Arc<Vec<f32>>> {
-    if !(1..=150).contains(&preset) {
+/// Returns the cached packed RGBA8 `f32` map `(map, width, height, mode)` for `preset` (`1..=200`),
+/// adjusted by optical `blur` (`0..100`).
+/// - Presets `151..=200` (Birds, Rainbows, SunGlow, Clouds) are returned at full **4K UHD (`3840 × 2160`)**
+///   from the Nano Banana 4K master plates.
+/// - Presets `1..=150` (LightLeaks, Bokeh, Sunbeams, Prism, CinemaWeather) are returned at `512 × 512`.
+pub fn overlay_map_cached(preset: u16, blur: f64) -> Option<CachedOvl> {
+    if !(1..=200).contains(&preset) {
         return None;
     }
-    let w_key = (warmth.clamp(-100.0, 100.0) * 2.0).round() as i32;
-    let b_key = (blur.clamp(0.0, 100.0) * 2.0).round() as i32;
-    let key = (preset, w_key, b_key);
+    let b_key = (blur.clamp(0.0, 100.0) * 0.25).round() as i32;
+    let key = (preset, b_key);
     if let Ok(guard) = MAP_CACHE.lock()
-        && let Some((_, map)) = guard.iter().find(|(k, _)| *k == key)
+        && let Some((_, entry)) = guard.iter().find(|(k, _)| *k == key)
     {
-        return Some(map.clone());
+        return Some(entry.clone());
     }
-    let map = Arc::new(synthesize_overlay_map(preset, warmth as f32, blur as f32));
+    let entry = synthesize_overlay_map(preset, blur as f32);
     if let Ok(mut guard) = MAP_CACHE.lock() {
-        if guard.len() >= 16 {
+        if guard.len() >= 6 {
             guard.remove(0);
         }
-        guard.push((key, map.clone()));
+        guard.push((key, entry.clone()));
     }
-    Some(map)
+    Some(entry)
 }
 
-fn synthesize_overlay_map(preset: u16, warmth: f32, blur: f32) -> Vec<f32> {
-    let spec_idx = (preset.saturating_sub(1) as usize).min(149);
+fn synthesize_overlay_map(preset: u16, blur: f32) -> CachedOvl {
+    let spec_idx = (preset.saturating_sub(1) as usize).min(catalog().len().saturating_sub(1));
     let spec = &catalog()[spec_idx];
+
+    // Nature Overlays (`151..=200`): use the 4K (`3840 × 2160`) Nano Banana photographic plates!
+    if matches!(
+        spec.category,
+        OverlayCategory::Birds
+            | OverlayCategory::Rainbows
+            | OverlayCategory::SunGlow
+            | OverlayCategory::Clouds
+    ) {
+        let mode = match spec.category {
+            OverlayCategory::Birds | OverlayCategory::Clouds => 1u32,
+            _ => 0u32,
+        };
+        let packed = build_nature_overlay_packed_map(spec, OVL_4K_W, OVL_4K_H, blur);
+        return (Arc::new(packed), OVL_4K_W as u32, OVL_4K_H as u32, mode);
+    }
+
     let sub_idx = ((preset - 1) % 30) as usize;
     let seed = (preset as u32).wrapping_mul(0x9E37_79B9);
 
@@ -588,71 +686,39 @@ fn synthesize_overlay_map(preset: u16, warmth: f32, blur: f32) -> Vec<f32> {
                 }
             }
         }
+        _ => {}
     }
 
-    // Apply optional optical blur
+    // Pack procedural linear RGB into sRGB RGBA8 `f32` words (`OVL_SIDE × OVL_SIDE`)
+    let mut packed = Vec::with_capacity(OVL_SIDE * OVL_SIDE);
+    for px in buf.as_chunks::<3>().0 {
+        let r8 = (px[0].max(0.0).sqrt().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let g8 = (px[1].max(0.0).sqrt().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let b8 = (px[2].max(0.0).sqrt().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        packed.push(pack_rgba8_f32(r8, g8, b8, 255));
+    }
+
     if blur > 0.5 {
-        let radius = ((blur / 100.0) * 14.0).round() as usize;
+        let radius = ((blur / 100.0) * 18.0).round() as usize;
         if radius > 0 {
-            buf = box_blur_rgb(&buf, OVL_SIDE, OVL_SIDE, radius);
+            packed = box_blur_packed_rgba8(&packed, OVL_SIDE, OVL_SIDE, radius);
         }
     }
 
-    // Apply warmth / hue shift and clamp
-    for px in buf.as_chunks_mut::<3>().0 {
-        *px = rotate_rgb_warmth(*px, warmth).map(|v| v.clamp(0.0, 2.0));
-    }
-    buf
-}
-
-fn box_blur_rgb(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
-    let r = radius.min(20).max(1);
-    let mut tmp = vec![0.0f32; w * h * 3];
-    let mut out = vec![0.0f32; w * h * 3];
-    for y in 0..h {
-        for x in 0..w {
-            let x0 = x.saturating_sub(r);
-            let x1 = (x + r).min(w - 1);
-            let inv = 1.0 / ((x1 - x0 + 1) as f32);
-            let mut sum = [0.0f32; 3];
-            for xx in x0..=x1 {
-                let i = (y * w + xx) * 3;
-                sum[0] += src[i];
-                sum[1] += src[i + 1];
-                sum[2] += src[i + 2];
-            }
-            let o = (y * w + x) * 3;
-            tmp[o] = sum[0] * inv;
-            tmp[o + 1] = sum[1] * inv;
-            tmp[o + 2] = sum[2] * inv;
-        }
-    }
-    for y in 0..h {
-        let y0 = y.saturating_sub(r);
-        let y1 = (y + r).min(h - 1);
-        let inv = 1.0 / ((y1 - y0 + 1) as f32);
-        for x in 0..w {
-            let mut sum = [0.0f32; 3];
-            for yy in y0..=y1 {
-                let i = (yy * w + x) * 3;
-                sum[0] += tmp[i];
-                sum[1] += tmp[i + 1];
-                sum[2] += tmp[i + 2];
-            }
-            let o = (y * w + x) * 3;
-            out[o] = sum[0] * inv;
-            out[o + 1] = sum[1] * inv;
-            out[o + 2] = sum[2] * inv;
-        }
-    }
-    out
+    (Arc::new(packed), OVL_SIDE as u32, OVL_SIDE as u32, 0)
 }
 
 /// Resolved per-render parameters for the active creative overlay, shared between CPU (`finish.rs`)
 /// and GPU (`params.rs` / `finish.wgsl`).
 #[derive(Clone, Debug)]
 pub struct OverlayPlan {
+    /// Packed RGBA8 `u32` (stored as `f32::from_bits`) texture (`w × h` words).
     pub map: Arc<Vec<f32>>,
+    pub w: u32,
+    pub h: u32,
+    /// `1` = RGBA alpha-composited photographic nature overlay (`Birds`, `Clouds`);
+    /// `0` = optical light/screen overlay (`LightLeaks`, `Bokeh`, `Sunbeams`, `Prism`, `Cinema`, `Rainbows`, `SunGlow`).
+    pub mode: u32,
     pub amount: f32,
     pub blend: u32,
     pub cos_a: f32,
@@ -661,6 +727,7 @@ pub struct OverlayPlan {
     pub shift_x: f32,
     pub shift_y: f32,
     pub protect_center: f32,
+    pub warmth_shift: f32,
     pub flip_x: bool,
     pub flip_y: bool,
 }
@@ -670,8 +737,8 @@ impl OverlayPlan {
         if !ovl.is_active() {
             return None;
         }
-        let preset = ovl.preset.round().clamp(1.0, 150.0) as u16;
-        let map = overlay_map_cached(preset, ovl.warmth, ovl.blur)?;
+        let preset = ovl.preset.round().clamp(1.0, 200.0) as u16;
+        let (map, w, h, mode) = overlay_map_cached(preset, ovl.blur)?;
         let amount = (ovl.amount / 100.0).clamp(0.0, 1.0) as f32;
         if amount <= 0.0 {
             return None;
@@ -680,6 +747,9 @@ impl OverlayPlan {
         let scale = (ovl.scale / 100.0).clamp(0.3, 2.5) as f32;
         Some(Self {
             map,
+            w,
+            h,
+            mode,
             amount,
             blend: (ovl.blend.round().clamp(0.0, 3.0)) as u32,
             cos_a: rad.cos(),
@@ -688,13 +758,14 @@ impl OverlayPlan {
             shift_x: (ovl.pos_x / 100.0).clamp(-1.0, 1.0) as f32 * 0.48,
             shift_y: (ovl.pos_y / 100.0).clamp(-1.0, 1.0) as f32 * 0.48,
             protect_center: (ovl.protect_center / 100.0).clamp(0.0, 1.0) as f32,
+            warmth_shift: (ovl.warmth / 100.0).clamp(-1.0, 1.0) as f32,
             flip_x: ovl.flip_x >= 0.5,
             flip_y: ovl.flip_y >= 0.5,
         })
     }
 
-    /// Evaluates and blends the overlay onto sRGB-encoded pixel `e` (`[0..1; 3]`) at normalized
-    /// frame coordinates `(nx, ny)` in `0..1`. Mirrors `apply_overlay` in `finish.wgsl`.
+    /// Evaluates and blends the 4K / optical overlay onto sRGB-encoded pixel `e` (`[0..1; 3]`)
+    /// at normalized frame coordinates `(nx, ny)` in `0..1`. Mirrors `F_OVL` in `finish.wgsl`.
     #[inline]
     pub fn apply_srgb(&self, e: [f32; 3], nx: f32, ny: f32) -> [f32; 3] {
         let dx = nx - 0.5 - self.shift_x;
@@ -712,49 +783,86 @@ impl OverlayPlan {
         if self.flip_y {
             v = 1.0 - v;
         }
-        let side = OVL_SIDE as f32;
-        let fx = (u * (side - 1.0)).clamp(0.0, side - 1.0001);
-        let fy = (v * (side - 1.0)).clamp(0.0, side - 1.0001);
+        let fw = self.w as f32;
+        let fh = self.h as f32;
+        let fx = (u * (fw - 1.0)).clamp(0.0, fw - 1.0001);
+        let fy = (v * (fh - 1.0)).clamp(0.0, fh - 1.0001);
         let x0 = fx as usize;
         let y0 = fy as usize;
         let tx = fx - x0 as f32;
         let ty = fy - y0 as f32;
-        let i00 = (y0 * OVL_SIDE + x0) * 3;
-        let i10 = (y0 * OVL_SIDE + x0 + 1) * 3;
-        let i01 = ((y0 + 1) * OVL_SIDE + x0) * 3;
-        let i11 = ((y0 + 1) * OVL_SIDE + x0 + 1) * 3;
-        let mut ov = [0.0f32; 3];
-        for c in 0..3 {
-            let top = self.map[i00 + c] * (1.0 - tx) + self.map[i10 + c] * tx;
-            let bot = self.map[i01 + c] * (1.0 - tx) + self.map[i11 + c] * tx;
-            ov[c] = (top * (1.0 - ty) + bot * ty).max(0.0).sqrt();
+        let stride = self.w as usize;
+        let p00 = unpack_rgba8_f32(self.map[y0 * stride + x0]);
+        let p10 = unpack_rgba8_f32(self.map[y0 * stride + x0 + 1]);
+        let p01 = unpack_rgba8_f32(self.map[(y0 + 1) * stride + x0]);
+        let p11 = unpack_rgba8_f32(self.map[(y0 + 1) * stride + x0 + 1]);
+        let mut rgba = [0.0f32; 4];
+        for c in 0..4 {
+            let top = p00[c] * (1.0 - tx) + p10[c] * tx;
+            let bot = p01[c] * (1.0 - tx) + p11[c] * tx;
+            rgba[c] = top * (1.0 - ty) + bot * ty;
         }
+
         // Center / subject protection attenuation
         let center_d = ((nx - 0.5).powi(2) + (ny - 0.5).powi(2)).sqrt() * 2.0;
         let protect = 1.0 - self.protect_center * 0.82 * (1.0 - sstep(0.18, 0.85, center_d));
         let k = (self.amount * protect).clamp(0.0, 1.0);
-        if k <= 1e-4 {
+        let ov_a = rgba[3].clamp(0.0, 1.0);
+        if k <= 1e-4 || ov_a <= 1e-4 {
             return e;
         }
+
+        let w_sh = self.warmth_shift;
+        let ov_rgb = [
+            (rgba[0] * (1.0 + 0.25 * w_sh)).clamp(0.0, 1.0),
+            (rgba[1] * (1.0 + 0.04 * w_sh)).clamp(0.0, 1.0),
+            (rgba[2] * (1.0 - 0.25 * w_sh)).clamp(0.0, 1.0),
+        ];
+
         let mut out = [0.0f32; 3];
-        for c in 0..3 {
-            let b = e[c].clamp(0.0, 1.0);
-            let s = (ov[c] * k).clamp(0.0, 1.2);
-            let blended = match self.blend {
-                0 => 1.0 - (1.0 - b) * (1.0 - s.min(1.0)), // Screen (Pantalla)
-                1 => {
-                    // Soft Light (Luz Suave)
-                    let sl = (1.0 - 2.0 * s.min(1.0)) * b * b + 2.0 * s.min(1.0) * b;
-                    b + (sl - b) * 0.85 + s * 0.35
-                }
-                2 => (b + s * 0.90).min(1.0), // Linear Dodge / Add (Añadir)
-                _ => {
-                    // Overlay / Superponer
-                    let ov_b = if b < 0.5 { 2.0 * b * s.min(1.0) } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - s.min(1.0)) };
-                    b * (1.0 - k * 0.65) + ov_b * (k * 0.65) + s * 0.25
-                }
-            };
-            out[c] = blended.clamp(0.0, 1.0);
+        if self.mode == 1 {
+            // Photographic RGBA alpha-composited nature element (4K Birds, 4K Clouds)
+            let a = (ov_a * k).clamp(0.0, 1.0);
+            for c in 0..3 {
+                let b = e[c].clamp(0.0, 1.0);
+                let fg_c = ov_rgb[c];
+                let blended = match self.blend {
+                    0 => b * (1.0 - a) + fg_c * a,
+                    1 => {
+                        let sl = (1.0 - 2.0 * fg_c) * b * b + 2.0 * fg_c * b;
+                        b * (1.0 - a) + (fg_c * 0.35 + sl * 0.65) * a
+                    }
+                    2 => (b + fg_c * a * 0.90).min(1.0),
+                    _ => {
+                        let ov_b = if b < 0.5 { 2.0 * b * fg_c } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - fg_c) };
+                        b * (1.0 - a) + (fg_c * 0.45 + ov_b * 0.55) * a
+                    }
+                };
+                out[c] = blended.clamp(0.0, 1.0);
+            }
+        } else {
+            // Optical light / atmospheric emission (4K Rainbows, 4K SunGlow, LightLeaks, Bokeh, Sunbeams, Prism, Cinema)
+            for c in 0..3 {
+                let b = e[c].clamp(0.0, 1.0);
+                let s = (ov_rgb[c] * ov_a * k).clamp(0.0, 1.2);
+                let s_m = s.min(1.0);
+                let blended = match self.blend {
+                    0 => 1.0 - (1.0 - b) * (1.0 - s_m), // Screen (Pantalla)
+                    1 => {
+                        // Soft Light (Luz Suave)
+                        let sl = (1.0 - 2.0 * s_m) * b * b + 2.0 * s_m * b;
+                        b + (sl - b) * 0.85 + s * 0.35
+                    }
+                    2 => (b + s * 0.90).min(1.0), // Linear Dodge / Add (Añadir)
+                    _ => {
+                        // Overlay / Superponer
+                        let ov_b = if b < 0.5 { 2.0 * b * s_m } else { 1.0 - 2.0 * (1.0 - b) * (1.0 - s_m) };
+                        let ok = k * ov_a * 0.65;
+                        b * (1.0 - ok) + ov_b * ok + s * 0.25
+                    }
+                };
+                out[c] = blended.clamp(0.0, 1.0);
+            }
         }
         out
     }

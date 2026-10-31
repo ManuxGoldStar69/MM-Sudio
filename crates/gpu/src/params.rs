@@ -75,9 +75,22 @@ const FIELDS: &[(&str, usize)] = &[
     ("OUT_GAMMA", 1),
     ("OVL", 1),
     ("OVL_OFF", 1),
+    ("OVL_W", 1),
+    ("OVL_H", 1),
+    ("OVL_MODE", 1),
     ("OVL_BLEND", 1),
     ("OVL_FLIP", 1),
-    ("OVL_PARAMS", 7),
+    ("OVL_PARAMS", 8),
+    ("SKY", 1),
+    ("SKY_OFF", 1),
+    ("SKY_MATTE_OFF", 1),
+    ("SKY_CAT", 1),
+    ("SKY_SEED", 1),
+    ("SKY_FLIP", 1),
+    ("SKY_PARAMS", 12),
+    ("SKY_AMB", 3),
+    ("SKY_HOR", 3),
+    ("SKY_ORIG", 3),
     // first row of a band dispatch (the kernel runs over rows Y0.., see `render`)
     ("Y0", 1),
 ];
@@ -165,12 +178,22 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
     if let Some(ovl) = &fp.overlay {
         aux.extend_from_slice(&ovl.map);
     }
+    let sky_off = aux.len();
+    let mut sky_matte_off = 0usize;
+    if let Some(sky) = &fp.sky {
+        aux.extend_from_slice(&sky.map);
+        sky_matte_off = aux.len();
+        aux.extend_from_slice(&sky.matte);
+    }
 
     let mut p = Block::new();
     p.fs("VIG_VIEW", &fp.view);
     if let Some(ovl) = &fp.overlay {
         p.b("OVL", true);
         p.u("OVL_OFF", ovl_off as u32);
+        p.u("OVL_W", ovl.w);
+        p.u("OVL_H", ovl.h);
+        p.u("OVL_MODE", ovl.mode);
         p.u("OVL_BLEND", ovl.blend);
         p.u("OVL_FLIP", (ovl.flip_x as u32) | ((ovl.flip_y as u32) << 1));
         p.fs(
@@ -183,8 +206,37 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], present: &Pr
                 ovl.shift_x,
                 ovl.shift_y,
                 ovl.protect_center,
+                ovl.warmth_shift,
             ],
         );
+    }
+    if let Some(sky) = &fp.sky {
+        p.b("SKY", true);
+        p.u("SKY_OFF", sky_off as u32);
+        p.u("SKY_MATTE_OFF", sky_matte_off as u32);
+        p.u("SKY_CAT", sky.category_id);
+        p.u("SKY_SEED", sky.seed);
+        p.u("SKY_FLIP", sky.flip_x as u32);
+        p.fs(
+            "SKY_PARAMS",
+            &[
+                sky.amount,
+                sky.horizon_y,
+                sky.feather,
+                sky.edge_refine,
+                sky.relight,
+                sky.haze,
+                sky.warmth_shift,
+                sky.exp_gain,
+                sky.inv_scale,
+                sky.shift_x,
+                sky.shift_y,
+                sky.horizon_offset,
+            ],
+        );
+        p.fs("SKY_AMB", &sky.ambient_rgb);
+        p.fs("SKY_HOR", &sky.horizon_rgb);
+        p.fs("SKY_ORIG", &sky.orig_sky_rgb);
     }
     p.u("W", fp.w as u32);
     p.u("H", fp.h as u32);

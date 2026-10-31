@@ -34,17 +34,21 @@ pub mod local;
 pub mod local_tone;
 pub mod lut;
 pub mod masks;
+pub mod nano_banana;
 pub mod optics;
 pub mod output;
 pub mod overlays;
 pub mod profiles;
 pub mod redeye;
+pub mod sky_model;
+pub mod smart_sky;
 pub mod spots;
 pub mod tone;
 pub mod transform;
 pub mod upright;
 pub mod visualize;
 
+pub use lightcraft_inpaint::current_cloud_mode_tag;
 pub use output::{DeepImage, DeepSamples, DisplaySpace, OutputDepth, OutputSpace, OutputTrc, Proof, ProofLut, proof_profile, register_proof_profile};
 pub use visualize::{MaskView, Overlay};
 
@@ -401,9 +405,27 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     visualize::adjust_settings(req.overlay, &mut settings);
     // a window must not choose a spot's source from the pixels it happens to hold: fix them
     // from a fixed-size render of the whole frame first
-    if req.window.is_some() && settings.spots.iter().any(|sp| sp.source_offset.is_none()) {
-        let picked: Vec<Option<lightcraft_geom::Point>> =
-            settings.spots.iter().map(|sp| sp.source_offset.or_else(|| spots::pick_source(src, info, &settings, sp, None))).collect();
+    let is_ai_spot = |sp: &lightcraft_develop::Spot| {
+        sp.mode == lightcraft_develop::SpotMode::Fill
+            || (sp.mode == lightcraft_develop::SpotMode::Remove && sp.points.len() >= 2)
+    };
+    if req.window.is_some()
+        && settings
+            .spots
+            .iter()
+            .any(|sp| sp.source_offset.is_none() && !is_ai_spot(sp))
+    {
+        let picked: Vec<Option<lightcraft_geom::Point>> = settings
+            .spots
+            .iter()
+            .map(|sp| {
+                if is_ai_spot(sp) {
+                    sp.source_offset
+                } else {
+                    sp.source_offset.or_else(|| spots::pick_source(src, info, &settings, sp, None))
+                }
+            })
+            .collect();
         for (sp, o) in settings.to_mut().spots.iter_mut().zip(picked) {
             sp.source_offset = o;
         }
@@ -440,10 +462,16 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
     let (wb_t, wb_tint) = local::effective_wb(info, s);
     let eyes = redeye::resolve(src, &s.red_eye, s.orientation, &frame, w, h, px_per_long);
     let d = &s.detail;
+    let ai_cfg_sig: (bool, u64) = if !s.spots.is_empty() || s.overlay.has_outpaint() {
+        lightcraft_inpaint::current_cloud_mode_tag()
+    } else {
+        (false, 0)
+    };
     let pre_nr_key = hash_of((
         geo,
         [wb_t, wb_tint, info.as_shot_temp, info.as_shot_tint].map(f64::to_bits),
         format!("{:?}", s.spots),
+        ai_cfg_sig,
         [
             s.overlay.expand_all,
             s.overlay.expand_top,

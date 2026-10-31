@@ -535,8 +535,8 @@ pub fn draw_welcome_modal(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // Backdrop veil
     ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(158));
 
-    let modal_w = 560.0f32.min(screen.width() - 28.0);
-    let modal_h = 584.0f32.min(screen.height() - 20.0);
+    let modal_w = 576.0f32.min(screen.width() - 28.0);
+    let modal_h = 612.0f32.min(screen.height() - 16.0);
     let card = Rect::from_center_size(screen.center(), vec2(modal_w, modal_h));
 
     // Close if user presses Escape or clicks outside the card
@@ -595,22 +595,22 @@ pub fn draw_welcome_modal(app: &mut LightcraftApp, ui: &mut egui::Ui) {
 
     // Body paragraph
     let body_text = "Este programa está hecho basándose en el repositorio de código abierto\n\
-LightCraft (storytold/lightcraft), modificado con mejoras de rendimiento, LUTs\n\
-creativos, galería de Overlays HD, eliminación de objetos y expansión de bordes con IA\n\
+LightCraft (storytold/lightcraft), modificado con mejoras de rendimiento, creador\n\
+de Fotobooks, Overlays HD, eliminación de objetos (Beta) y expansión de bordes IA\n\
 para disfrutar y explotar al máximo la creatividad.";
     ui.painter().text(
         pos2(card.center().x, logo_rect.bottom() + 54.0),
         Align2::CENTER_TOP,
         body_text,
-        t.font(11.8),
+        t.font(11.6),
         Color32::from_rgb(212, 208, 200),
     );
 
     // Announcement Box: New Features Implemented
-    let news_top = logo_rect.bottom() + 132.0;
+    let news_top = logo_rect.bottom() + 126.0;
     let news_box = Rect::from_min_max(
         pos2(card.left() + 26.0, news_top),
-        pos2(card.right() - 26.0, card.bottom() - 168.0),
+        pos2(card.right() - 26.0, card.bottom() - 166.0),
     );
     ui.painter().rect(
         news_box,
@@ -621,47 +621,51 @@ para disfrutar y explotar al máximo la creatividad.";
     );
 
     ui.painter().text(
-        pos2(news_box.left() + 14.0, news_box.top() + 10.0),
+        pos2(news_box.left() + 14.0, news_box.top() + 9.0),
         Align2::LEFT_TOP,
-        "✨ ANUNCIO: NUEVAS MEJORAS IMPLEMENTADAS",
-        t.semibold(11.5),
+        "✨ ANUNCIO: NUEVAS FUNCIONES Y MEJORAS IMPLEMENTADAS",
+        t.semibold(11.4),
         Color32::from_rgb(124, 238, 190),
     );
 
     let items = [
         (
-            "• Galería de 180 Overlays HD (Efectos):",
+            "• Eliminación de Objetos con IA [BETA] (Cloud + Local 6K):",
+            "Motores Cloud IA (PixelAPI, PhotoRoom y Stability) + Curado LAB con caché sin gasto doble.",
+        ),
+        (
+            "• Nuevo Creador de Fotobooks y Álbumes (Módulo Imprimir):",
+            "Diseño editorial multipágina para bodas y sesiones con plantillas dinámicas listas para imprenta.",
+        ),
+        (
+            "• Galería de 180 Overlays HD y Cielos IA (Efectos):",
             "6 categorías (Bokeh, Fugas de Luz, Destellos, Lluvia, Polvo y Atmósfera) manipulables con 1 clic.",
-        ),
-        (
-            "• Mejoras en el Rendimiento (60 FPS):",
-            "Edición ultra-fluida en tiempo real en GPU, caché inteligente y cambio instantáneo entre fotos.",
-        ),
-        (
-            "• Eliminación de Objetos con IA y Máscaras:",
-            "Borrado generativo local (LaMa), Curado por Separación de Frecuencias LAB y máscaras IA.",
         ),
         (
             "• Expansión Generativa de Imagen con IA:",
             "Ampliación inteligente de bordes (+10% a +30%) con síntesis de detalle nativo 1:1.",
         ),
+        (
+            "• Rendimiento Optimizado (60 FPS + Caché Instantáneo):",
+            "Edición ultra-fluida en GPU, pre-decodificación rápida de parches IA y cambio ágil entre fotos.",
+        ),
     ];
 
-    let mut row_y = news_box.top() + 31.0;
-    let row_step = ((news_box.height() - 36.0) / 4.0).clamp(24.0, 32.0);
+    let mut row_y = news_box.top() + 29.0;
+    let row_step = ((news_box.height() - 32.0) / 5.0).clamp(22.0, 29.5);
     for (title_b, desc_b) in items {
         ui.painter().text(
             pos2(news_box.left() + 14.0, row_y),
             Align2::LEFT_TOP,
             title_b,
-            t.semibold(11.0),
+            t.semibold(10.6),
             Color32::from_rgb(248, 244, 234),
         );
         ui.painter().text(
-            pos2(news_box.left() + 24.0, row_y + 13.5),
+            pos2(news_box.left() + 24.0, row_y + 12.5),
             Align2::LEFT_TOP,
             desc_b,
-            t.font(10.3),
+            t.font(9.9),
             Color32::from_rgb(204, 210, 206),
         );
         row_y += row_step;

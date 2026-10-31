@@ -292,7 +292,7 @@ controls! {
     "calibration.blueHue" => calibration.blue_hue, "Blue Hue", Calibration, -100, 100, 0, 1, 0, Gradient { from: "#30a0d0", to: "#8040d0" };
     "calibration.blueSat" => calibration.blue_sat, "Blue Saturation", Calibration, -100, 100, 0, 1, 0, Gradient { from: "#7a7a7a", to: "#3a60e0" };
     "crop.angle" => crop.geometry.angle, "Straighten", Geometry, -45, 45, 0, 0.01, 2, Centered;
-    "overlay.preset" => overlay.preset, "Overlay", Overlay, 0, 150, 0, 1, 0, Plain;
+    "overlay.preset" => overlay.preset, "Overlay", Overlay, 0, 200, 0, 1, 0, Plain;
     "overlay.amount" => overlay.amount, "Intensidad", Overlay, 0, 100, 65, 1, 0, Plain;
     "overlay.blend" => overlay.blend, "Fusión", Overlay, 0, 3, 0, 1, 0, Plain;
     "overlay.posX" => overlay.pos_x, "Posición X", Overlay, -100, 100, 0, 1, 0, Centered;
@@ -310,6 +310,20 @@ controls! {
     "overlay.expandLeft" => overlay.expand_left, "Ampliar Izquierda (%)", Overlay, 0, 35, 0, 1, 0, Plain;
     "overlay.expandRight" => overlay.expand_right, "Ampliar Derecha (%)", Overlay, 0, 35, 0, 1, 0, Plain;
     "overlay.fillBorders" => overlay.fill_borders, "Rellenar Esquinas", Overlay, 0, 1, 0, 1, 0, Plain;
+    "sky.preset" => sky.preset, "SmartSky", Overlay, 0, 100, 0, 1, 0, Plain;
+    "sky.amount" => sky.amount, "Intensidad del Cielo", Overlay, 0, 100, 88, 1, 0, Plain;
+    "sky.horizonBlend" => sky.horizon_blend, "Transición Horizonte", Overlay, 0, 100, 45, 1, 0, Plain;
+    "sky.horizonPos" => sky.horizon_pos, "Altura Horizonte", Overlay, -100, 100, 0, 1, 0, Centered;
+    "sky.edgeRefine" => sky.edge_refine, "Refinar Bordes y Ramas", Overlay, 0, 100, 75, 1, 0, Plain;
+    "sky.relight" => sky.relight, "Re-iluminar Escena IA", Overlay, 0, 100, 55, 1, 0, Plain;
+    "sky.haze" => sky.haze, "Bruma Atmosférica", Overlay, 0, 100, 20, 1, 0, Plain;
+    "sky.defocus" => sky.defocus, "Desenfoque de Lente (Bokeh)", Overlay, 0, 100, 0, 1, 0, Plain;
+    "sky.warmth" => sky.warmth, "Temperatura del Cielo", Overlay, -100, 100, 0, 1, 0, Temp;
+    "sky.brightness" => sky.brightness, "Brillo / Exposición", Overlay, -100, 100, 0, 1, 0, Centered;
+    "sky.posX" => sky.pos_x, "Desplazar Cielo X", Overlay, -100, 100, 0, 1, 0, Centered;
+    "sky.posY" => sky.pos_y, "Desplazar Cielo Y", Overlay, -100, 100, 0, 1, 0, Centered;
+    "sky.scale" => sky.scale, "Escala del Cielo", Overlay, 50, 250, 100, 1, 0, Plain;
+    "sky.flipX" => sky.flip_x, "Voltear Cielo H", Overlay, 0, 1, 0, 1, 0, Plain;
 }
 
 /// Template specs of the indexed controls (`<family>.<field>`; addressed as `<family>.<i>.<field>`).

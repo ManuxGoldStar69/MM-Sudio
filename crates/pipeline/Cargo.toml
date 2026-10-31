@@ -16,8 +16,12 @@ lightcraft-raster = { workspace = true }
 lightcraft-develop = { workspace = true }
 lightcraft-raw = { workspace = true }
 lightcraft-inpaint = { workspace = true }
+zune-jpeg = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { workspace = true }
 
 [dev-dependencies]
 lightcraft-scenes = { workspace = true }

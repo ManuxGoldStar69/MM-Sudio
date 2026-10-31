@@ -18,7 +18,7 @@
 
 use egui::epaint::{Mesh, Vertex};
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use lightcraft_catalog::{Flag, PhotoId};
+use lightcraft_catalog::{Flag, PhotoId, RatingOp};
 use lightcraft_develop::{ControlSpec, DevelopSettings, Track, WbMode, controls};
 use lightcraft_engine::LibrarySource;
 use lightcraft_geom::Point;
@@ -150,6 +150,59 @@ fn ambient_backdrop_texture(ctx: &egui::Context) -> egui::TextureHandle {
     let handle = ctx.load_texture("mm-studio-ambient-backdrop", img, egui::TextureOptions::LINEAR);
     if let Ok(mut guard) = CACHE.lock() {
         guard.insert(tm_ptr, handle.clone());
+    }
+    handle
+}
+
+/// Decodes and caches a 4K Nano Banana photographic thumbnail (`88×50` for SmartSky or `88×48` for Nature Overlays)
+/// with antialiased rounded top corners (`radius = 9px`) for carousel cards.
+fn nano_banana_card_texture(ctx: &egui::Context, is_sky: bool, preset: u16) -> egui::TextureHandle {
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(usize, bool, u16), egui::TextureHandle>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let tm_ptr = std::sync::Arc::as_ptr(&ctx.tex_manager()) as usize;
+    let key = (tm_ptr, is_sky, preset);
+    if let Ok(guard) = CACHE.lock()
+        && let Some(h) = guard.get(&key)
+        && ctx.tex_manager().read().meta(h.id()).is_some()
+    {
+        return h.clone();
+    }
+    let (w, h) = if is_sky { (88usize, 50usize) } else { (88usize, 48usize) };
+    let mut rgba = if is_sky {
+        lightcraft_pipeline::nano_banana::sky_thumb_rgba8(preset, w, h)
+    } else {
+        lightcraft_pipeline::nano_banana::nature_overlay_thumb_rgba8(preset, w, h)
+    };
+    let rad = 9.0f32;
+    for y in 0..(rad as usize + 1).min(h) {
+        let py = y as f32 + 0.5;
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            let dx = if px < rad {
+                rad - px
+            } else if px > w as f32 - rad {
+                px - (w as f32 - rad)
+            } else {
+                0.0
+            };
+            let dy = (rad - py).max(0.0);
+            if dx > 0.0 && dy > 0.0 {
+                let dist = (dx * dx + dy * dy).sqrt();
+                let cov = (rad + 0.5 - dist).clamp(0.0, 1.0);
+                let idx = (y * w + x) * 4 + 3;
+                rgba[idx] = ((rgba[idx] as f32) * cov).round() as u8;
+            }
+        }
+    }
+    let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+    let handle = ctx.load_texture(
+        format!("nb-4k-thumb-{}-{preset}", if is_sky { "sky" } else { "ovl" }),
+        img,
+        egui::TextureOptions::LINEAR,
+    );
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.insert(key, handle.clone());
     }
     handle
 }
@@ -949,13 +1002,21 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     // ------------------------------------------------------------------------
     // CARD 3: Proyectos (Vertical cards with 44×44 rounded thumbnail + title + photo count/rating)
     // ------------------------------------------------------------------------
-    let hdr3_y = card3.top() + 20.0;
+    let hdr3_y = card3.top() + 18.0;
+    let (_, vis_for_hdr) = app.session.visible_shared();
+    let total_for_hdr = app.session.source_total().unwrap_or(vis_for_hdr.len());
+    let has_active_filter = app.session.filter != Default::default();
+    let proj_title = if has_active_filter {
+        format!("Proyectos ({}/{})", vis_for_hdr.len(), total_for_hdr)
+    } else {
+        format!("Proyectos ({})", vis_for_hdr.len())
+    };
     ui.painter().text(
         pos2(card3.left() + 14.0, hdr3_y),
         Align2::LEFT_CENTER,
-        "Proyectos",
-        t.semibold(13.5),
-        Color32::WHITE,
+        proj_title,
+        t.semibold(13.0),
+        if has_active_filter { Color32::from_rgb(248, 204, 112) } else { Color32::WHITE },
     );
     let plus3_r = Rect::from_center_size(pos2(card3.right() - 20.0, hdr3_y), vec2(22.0, 22.0));
     let plus3_resp = ui
@@ -966,7 +1027,101 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         app.ui.dialog = Some(crate::state::Dialog::NewAlbum { name: String::new(), folder: false, parent: None, include_selected: true });
     }
 
-    let proj_rect = Rect::from_min_max(pos2(card3.left() + 6.0, card3.top() + 34.0), pos2(card3.right() - 6.0, card3.bottom() - 6.0));
+    // Quick Star & Flag Filter Strip inside Proyectos Card: [Todas] [1★] [2★] [3★] [4★] [5★] [⚑]
+    let fstrip_r = Rect::from_min_max(pos2(card3.left() + 8.0, card3.top() + 32.0), pos2(card3.right() - 8.0, card3.top() + 52.0));
+    {
+        let cur_r = app.session.filter.rating;
+        let cur_flag = app.session.filter.flag;
+        let pills: [(u8, bool, &str, &str); 7] = [
+            (0, false, "Todas", "Mostrar todas las fotos (limpiar filtro)"),
+            (1, false, "1★", "Filtrar fotos con 1 o más estrellas"),
+            (2, false, "2★", "Filtrar fotos con 2 o más estrellas"),
+            (3, false, "3★", "Filtrar fotos con 3 o más estrellas"),
+            (4, false, "4★", "Filtrar fotos con 4 o más estrellas"),
+            (5, false, "5★", "Filtrar fotos con 5 estrellas"),
+            (0, true, "⚑", "Filtrar solo fotos marcadas como Favoritas / Pick"),
+        ];
+        let gap_p = 3.0;
+        let total_w = fstrip_r.width();
+        let first_w = 40.0;
+        let rem_w = (total_w - first_w - gap_p * 6.0).max(60.0);
+        let small_w = rem_w / 6.0;
+        let mut px = fstrip_r.left();
+        for (idx, (r_val, is_flag_pill, lbl, tip)) in pills.iter().enumerate() {
+            let pw = if idx == 0 { first_w } else { small_w };
+            let pr = Rect::from_min_size(pos2(px, fstrip_r.top()), vec2(pw, fstrip_r.height()));
+            px += pw + gap_p;
+            let active = if idx == 0 {
+                cur_r == 0 && cur_flag.is_none() && !has_active_filter
+            } else if *is_flag_pill {
+                cur_flag == Some(Flag::Pick)
+            } else {
+                cur_r == *r_val
+            };
+            let presp = ui.interact(pr, egui::Id::new(("studio-proj-filter-pill", idx)), Sense::click()).on_hover_text(*tip);
+            ui.painter().rect(
+                pr,
+                CornerRadius::same(5),
+                if active && idx > 0 {
+                    Color32::from_rgb(245, 192, 96).gamma_multiply(0.32)
+                } else if active {
+                    Color32::from_white_alpha(28)
+                } else if presp.hovered() {
+                    Color32::from_white_alpha(22)
+                } else {
+                    Color32::from_white_alpha(10)
+                },
+                Stroke::new(
+                    1.0,
+                    if active && idx > 0 {
+                        Color32::from_rgb(245, 192, 96)
+                    } else if active {
+                        Color32::from_white_alpha(52)
+                    } else {
+                        Color32::from_white_alpha(22)
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            if *is_flag_pill {
+                paint(
+                    ui.painter(),
+                    Rect::from_center_size(pr.center(), vec2(11.0, 11.0)),
+                    if active { Icon::FlagPickFilled } else { Icon::FlagPick },
+                    if active { Color32::from_rgb(255, 212, 118) } else { Color32::from_rgb(205, 210, 220) },
+                );
+            } else {
+                ui.painter().text(
+                    pr.center(),
+                    Align2::CENTER_CENTER,
+                    *lbl,
+                    if active { t.semibold(9.5) } else { t.font(9.3) },
+                    if active && idx > 0 {
+                        Color32::from_rgb(255, 220, 138)
+                    } else if active {
+                        Color32::WHITE
+                    } else {
+                        Color32::from_rgb(205, 210, 220)
+                    },
+                );
+            }
+            if presp.clicked() {
+                if idx == 0 {
+                    app.ui.search.clear();
+                    let _ = app.run("library.clearFilter", json!({}));
+                } else if *is_flag_pill {
+                    let next_flag = if cur_flag == Some(Flag::Pick) { serde_json::Value::Null } else { json!("pick") };
+                    let _ = app.run("library.filter", json!({"flag": next_flag}));
+                } else {
+                    let next_r = if cur_r == *r_val { 0 } else { *r_val };
+                    let _ = app.run("library.filter", json!({"rating": next_r}));
+                }
+                ensure_active_photo(app);
+            }
+        }
+    }
+
+    let proj_rect = Rect::from_min_max(pos2(card3.left() + 6.0, card3.top() + 56.0), pos2(card3.right() - 6.0, card3.bottom() - 6.0));
     let mut proj_ui = ui.new_child(egui::UiBuilder::new().max_rect(proj_rect).layout(egui::Layout::top_down(egui::Align::Min)));
     egui::ScrollArea::vertical()
         .id_salt("studio-projects-scroll")
@@ -977,6 +1132,30 @@ fn show_left_sidebar(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             let (_, vis_photos) = app.session.visible_shared();
             let active_id = app.session.active();
             let ppp = ui.ctx().pixels_per_point();
+
+            if vis_photos.is_empty() && has_active_filter {
+                let (empty_r, empty_resp) = ui.allocate_exact_size(vec2(w, 84.0), Sense::click());
+                ui.painter().text(
+                    pos2(empty_r.center().x, empty_r.center().y - 10.0),
+                    Align2::CENTER_CENTER,
+                    "Sin fotos con este filtro",
+                    t.semibold(11.5),
+                    Color32::from_rgb(210, 214, 224),
+                );
+                ui.painter().text(
+                    pos2(empty_r.center().x, empty_r.center().y + 10.0),
+                    Align2::CENTER_CENTER,
+                    "✕ Limpiar filtro",
+                    t.semibold(11.0),
+                    Color32::from_rgb(245, 198, 102),
+                );
+                if empty_resp.clicked() {
+                    app.ui.search.clear();
+                    let _ = app.run("library.clearFilter", json!({}));
+                    ensure_active_photo(app);
+                }
+                return;
+            }
 
             // Virtualized list of individual photos of the current album downwards (`hacia abajo`)
             let multi_sel = app.session.selection.ids.len() > 1;
@@ -1155,7 +1334,8 @@ fn show_center_stage(app: &mut LightcraftApp, ui: &mut egui::Ui, stage_rect: Rec
     paint_glass_card(ui.painter(), stage_rect, 18, 168);
 
     let top_bar_h = 42.0;
-    let show_film = app.ui.filmstrip && !app.ui.section_folded("studioBottomFilm") && !app.session.visible().is_empty();
+    let has_filter = app.session.filter != Default::default();
+    let show_film = app.ui.filmstrip && !app.ui.section_folded("studioBottomFilm") && (!app.session.visible().is_empty() || has_filter);
     let film_h = if show_film { 68.0 } else { 0.0 };
     let mid_bar_h = 36.0;
 
@@ -1411,20 +1591,24 @@ fn show_center_stage(app: &mut LightcraftApp, ui: &mut egui::Ui, stage_rect: Rec
         ui.painter().rect_filled(Rect::from_min_max(pos2(sl_r.left(), cy - 1.2), pos2(tx, cy + 1.2)), 1.0, Color32::from_white_alpha(150));
         ui.painter().circle_filled(pos2(tx, cy), 5.5, Color32::WHITE);
 
-        // Right side of Middle Control Sub-bar: [📋 Pegar ajustes (N)] [✓ Todas] ★★★★☆   ⋯   🗑
+        // Right side of Middle Control Sub-bar: [📋 Pegar ajustes (N)] [✓ Todas] [Filtro ≥ ★★★★★ ⚑ ✕]   ⋯   🗑
         let del_r = Rect::from_min_size(pos2(mid_sub.right() - 32.0, cy - 13.0), vec2(26.0, 26.0));
         let more_r = Rect::from_min_size(pos2(del_r.left() - 30.0, cy - 13.0), vec2(26.0, 26.0));
-        let stars_r = Rect::from_min_size(pos2(more_r.left() - 104.0, cy - 12.0), vec2(96.0, 24.0));
+        let filter_active = app.session.filter.rating > 0
+            || app.session.filter.flag.is_some()
+            || app.session.filter.edited.is_some();
+        let filter_pill_w = if filter_active { 196.0 } else { 174.0 };
+        let filter_pill_r = Rect::from_min_size(pos2(more_r.left() - filter_pill_w - 6.0, cy - 12.0), vec2(filter_pill_w, 24.0));
 
         let sel_n = app.session.selection.ids.len();
         if sel_n > 1 || is_grid {
             let paste_lbl = if sel_n > 1 {
-                format!("📋 Pegar ajustes ({sel_n})")
+                format!("Pegar ajustes ({sel_n})")
             } else {
-                "📋 Pegar ajustes".to_string()
+                "Pegar ajustes".to_string()
             };
-            let paste_w = if sel_n > 1 { 142.0 } else { 118.0 };
-            let paste_r = Rect::from_min_size(pos2(stars_r.left() - paste_w - 8.0, cy - 12.0), vec2(paste_w, 24.0));
+            let paste_w = if sel_n > 1 { 134.0 } else { 110.0 };
+            let paste_r = Rect::from_min_size(pos2(filter_pill_r.left() - paste_w - 8.0, cy - 12.0), vec2(paste_w, 24.0));
             if paste_r.left() > sl_r.right() + 10.0 {
                 let p_resp = ui
                     .interact(paste_r, egui::Id::new("mid-stage-paste-multi"), Sense::click())
@@ -1453,14 +1637,14 @@ fn show_center_stage(app: &mut LightcraftApp, ui: &mut egui::Ui, stage_rect: Rec
                     paste_r.center(),
                     Align2::CENTER_CENTER,
                     paste_lbl,
-                    t.semibold(11.0),
+                    t.semibold(10.8),
                     if sel_n > 1 { Color32::from_rgb(255, 224, 150) } else { Color32::WHITE },
                 );
                 if p_resp.clicked() {
                     paste_all_adjustments_to_selection(app, ui.ctx());
                 }
 
-                let sel_all_r = Rect::from_min_size(pos2(paste_r.left() - 78.0, cy - 12.0), vec2(72.0, 24.0));
+                let sel_all_r = Rect::from_min_size(pos2(paste_r.left() - 74.0, cy - 12.0), vec2(68.0, 24.0));
                 if sel_all_r.left() > sl_r.right() + 8.0 {
                     let vis_total = app.session.visible_shared().1.len();
                     let all_selected = vis_total > 1 && sel_n >= vis_total;
@@ -1475,7 +1659,7 @@ fn show_center_stage(app: &mut LightcraftApp, ui: &mut egui::Ui, stage_rect: Rec
                         Stroke::new(1.0, Color32::from_white_alpha(38)),
                         StrokeKind::Inside,
                     );
-                    ui.painter().text(sel_all_r.center(), Align2::CENTER_CENTER, sa_lbl, t.font(10.8), Color32::from_rgb(220, 225, 235));
+                    ui.painter().text(sel_all_r.center(), Align2::CENTER_CENTER, sa_lbl, t.font(10.5), Color32::from_rgb(220, 225, 235));
                     if sa_resp.clicked() {
                         if all_selected {
                             if let Some(act) = app.session.selection.active {
@@ -1491,17 +1675,166 @@ fn show_center_stage(app: &mut LightcraftApp, ui: &mut egui::Ui, stage_rect: Rec
             }
         }
 
-        let rating = app.session.active().and_then(|id| app.session.catalog.photo(id)).map(|p| p.rating).unwrap_or(4);
-        let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(stars_r).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        if let Some(r) = stars(&mut sui, "mid-stage", rating, 15.0) {
-            let _ = app.run("photo.rate", json!({"rating": r}));
+        // Interactive Star & Flag Filter Pill: [Filtro ≥] [★★★★★] [⚑] [✕]
+        ui.painter().rect(
+            filter_pill_r,
+            CornerRadius::same(8),
+            if filter_active {
+                Color32::from_rgba_unmultiplied(245, 192, 96, 34)
+            } else {
+                Color32::from_white_alpha(14)
+            },
+            Stroke::new(
+                1.0,
+                if filter_active {
+                    Color32::from_rgb(245, 192, 96)
+                } else {
+                    Color32::from_white_alpha(28)
+                },
+            ),
+            StrokeKind::Inside,
+        );
+
+        let op_sym = match app.session.filter.rating_op {
+            RatingOp::AtLeast => "≥",
+            RatingOp::Exactly => "=",
+            RatingOp::AtMost => "≤",
+        };
+        let op_r = Rect::from_min_size(pos2(filter_pill_r.left() + 2.0, filter_pill_r.top() + 1.0), vec2(50.0, 22.0));
+        let op_resp = ui
+            .interact(op_r, egui::Id::new("mid-stage-filter-op"), Sense::click())
+            .on_hover_text("Filtrar por estrellas · Clic para cambiar entre Al menos (≥), Exactamente (=) o Máximo (≤)");
+        paint(
+            ui.painter(),
+            Rect::from_center_size(pos2(op_r.left() + 10.0, op_r.center().y), vec2(11.0, 11.0)),
+            Icon::Filter,
+            if filter_active { Color32::from_rgb(255, 214, 122) } else { Color32::from_rgb(192, 198, 210) },
+        );
+        ui.painter().text(
+            pos2(op_r.left() + 19.0, op_r.center().y),
+            Align2::LEFT_CENTER,
+            format!("Filtro {op_sym}"),
+            if filter_active { t.semibold(9.6) } else { t.font(9.5) },
+            if filter_active { Color32::from_rgb(255, 222, 145) } else { Color32::from_rgb(212, 216, 226) },
+        );
+        if op_resp.clicked() {
+            let next_op = match app.session.filter.rating_op {
+                RatingOp::AtLeast => "exactly",
+                RatingOp::Exactly => "atMost",
+                RatingOp::AtMost => "atLeast",
+            };
+            let _ = app.run("library.filter", json!({"ratingOp": next_op}));
+            ensure_active_photo(app);
         }
 
-        let m_resp = ui.interact(more_r, egui::Id::new("mid-stage-more"), Sense::click()).on_hover_text("Opciones de tira de fotos");
-        paint(ui.painter(), more_r.shrink(5.5), Icon::More, Color32::from_rgb(200, 205, 215));
-        if m_resp.clicked() {
-            app.ui.toggle_folded("studioBottomFilm");
+        let f_stars_r = Rect::from_min_size(pos2(op_r.right() + 2.0, cy - 11.0), vec2(88.0, 22.0));
+        let cur_filter_rating = app.session.filter.rating;
+        {
+            let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(f_stars_r).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            if let Some(r) = stars(&mut sui, "mid-stage", cur_filter_rating, 16.5) {
+                let _ = app.run("library.filter", json!({"rating": r}));
+                ensure_active_photo(app);
+            }
         }
+
+        let f_flag_r = Rect::from_min_size(pos2(f_stars_r.right() + 2.0, cy - 11.0), vec2(22.0, 22.0));
+        let f_flag_on = app.session.filter.flag == Some(Flag::Pick);
+        let f_flag_resp = ui
+            .interact(f_flag_r, egui::Id::new("mid-stage-filter-flag"), Sense::click())
+            .on_hover_text("Filtrar solo fotos marcadas como Favoritas / Pick (⚑)");
+        paint(
+            ui.painter(),
+            f_flag_r.shrink(4.5),
+            if f_flag_on { Icon::FlagPickFilled } else { Icon::FlagPick },
+            if f_flag_on { Color32::from_rgb(255, 206, 106) } else { Color32::from_rgb(198, 204, 216) },
+        );
+        if f_flag_resp.clicked() {
+            let next_flag = if f_flag_on { serde_json::Value::Null } else { json!("pick") };
+            let _ = app.run("library.filter", json!({"flag": next_flag}));
+            ensure_active_photo(app);
+        }
+
+        if filter_active {
+            let clr_r = Rect::from_min_size(pos2(f_flag_r.right() + 1.0, cy - 11.0), vec2(20.0, 22.0));
+            let clr_resp = ui
+                .interact(clr_r, egui::Id::new("mid-stage-filter-clear"), Sense::click())
+                .on_hover_text("Quitar filtro de estrellas / banderas y mostrar todas las fotos");
+            paint(
+                ui.painter(),
+                clr_r.shrink(5.5),
+                Icon::Close,
+                if clr_resp.hovered() { Color32::WHITE } else { Color32::from_rgb(255, 214, 122) },
+            );
+            if clr_resp.clicked() {
+                app.ui.search.clear();
+                let _ = app.run("library.clearFilter", json!({}));
+                ensure_active_photo(app);
+            }
+        }
+
+        let m_resp = ui
+            .interact(more_r, egui::Id::new("mid-stage-more"), Sense::click())
+            .on_hover_text("Opciones de filtrado por estrellas y tira de fotos");
+        paint(ui.painter(), more_r.shrink(5.5), Icon::More, Color32::from_rgb(200, 205, 215));
+        egui::Popup::menu(&m_resp).show(|ui| {
+            ui.set_min_width(220.0);
+            ui.label(egui::RichText::new("Filtrar por estrellas").strong().size(11.5));
+            for (r_val, lbl) in [
+                (0u8, "Todas las fotos (Sin filtro)"),
+                (1u8, "★  1 o más estrellas"),
+                (2u8, "★★  2 o más estrellas"),
+                (3u8, "★★★  3 o más estrellas"),
+                (4u8, "★★★★  4 o más estrellas"),
+                (5u8, "★★★★★  Solo 5 estrellas"),
+            ] {
+                if ui.selectable_label(app.session.filter.rating == r_val, lbl).clicked() {
+                    let _ = app.run("library.filter", json!({"rating": r_val}));
+                    ensure_active_photo(app);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Comparación de estrellas").strong().size(11.5));
+            for (op_val, op_key, op_lbl) in [
+                (RatingOp::AtLeast, "atLeast", "≥  Al menos N estrellas"),
+                (RatingOp::Exactly, "exactly", "=  Exactamente N estrellas"),
+                (RatingOp::AtMost, "atMost", "≤  Máximo N estrellas"),
+            ] {
+                if ui.selectable_label(app.session.filter.rating_op == op_val, op_lbl).clicked() {
+                    let _ = app.run("library.filter", json!({"ratingOp": op_key}));
+                    ensure_active_photo(app);
+                    ui.close();
+                }
+            }
+            ui.separator();
+            let pick_on = app.session.filter.flag == Some(Flag::Pick);
+            if ui.selectable_label(pick_on, "⚑  Solo Favoritas / Pick").clicked() {
+                let next_f = if pick_on { serde_json::Value::Null } else { json!("pick") };
+                let _ = app.run("library.filter", json!({"flag": next_f}));
+                ensure_active_photo(app);
+                ui.close();
+            }
+            let ed_on = app.session.filter.edited == Some(true);
+            if ui.selectable_label(ed_on, "Solo fotos editadas").clicked() {
+                let next_e = if ed_on { serde_json::Value::Null } else { json!(true) };
+                let _ = app.run("library.filter", json!({"edited": next_e}));
+                ensure_active_photo(app);
+                ui.close();
+            }
+            if app.session.filter != Default::default()
+                && ui.button("✕  Limpiar todos los filtros").clicked()
+            {
+                app.ui.search.clear();
+                let _ = app.run("library.clearFilter", json!({}));
+                ensure_active_photo(app);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Mostrar / ocultar tira de fotos (F6)").clicked() {
+                app.ui.toggle_folded("studioBottomFilm");
+                ui.close();
+            }
+        });
 
         let d_resp = ui.interact(del_r, egui::Id::new("mid-stage-trash"), Sense::click()).on_hover_text("Mover foto a Eliminadas (⌫)");
         paint(ui.painter(), del_r.shrink(5.0), Icon::Trash, if d_resp.hovered() { Color32::from_rgb(245, 110, 110) } else { Color32::from_rgb(200, 205, 215) });
@@ -1607,6 +1940,22 @@ fn show_zoom_pill_in_bar(app: &mut LightcraftApp, ui: &mut egui::Ui, zoom_r: Rec
 fn show_bottom_filmstrip(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let (_, ids) = app.session.visible_shared();
+    if ids.is_empty() && app.session.filter != Default::default() {
+        let (empty_r, empty_resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+        ui.painter().text(
+            empty_r.center(),
+            Align2::CENTER_CENTER,
+            "Ninguna foto coincide con el filtro actual · Haz clic aquí para mostrar todas las fotos",
+            t.semibold(11.5),
+            Color32::from_rgb(245, 198, 102),
+        );
+        if empty_resp.clicked() {
+            app.ui.search.clear();
+            let _ = app.run("library.clearFilter", json!({}));
+            ensure_active_photo(app);
+        }
+        return;
+    }
     let active = app.session.selection.active;
     let multi_sel = app.session.selection.ids.len() > 1;
     let ppp = ui.ctx().pixels_per_point();
@@ -1703,6 +2052,20 @@ fn show_bottom_filmstrip(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     if is_selected {
                         p.text(check_r.center(), Align2::CENTER_CENTER, "✓", t.semibold(9.5), Color32::from_rgb(20, 16, 10));
                     }
+                }
+
+                if let Some(photo) = app.session.catalog.photo(id)
+                    && photo.rating > 0
+                {
+                    let badge_r = Rect::from_min_size(pos2(thumb_r.left() + 3.0, thumb_r.bottom() - 15.0), vec2(24.0, 13.0));
+                    p.rect_filled(badge_r, CornerRadius::same(4), Color32::from_black_alpha(175));
+                    p.text(
+                        badge_r.center(),
+                        Align2::CENTER_CENTER,
+                        format!("{}★", photo.rating),
+                        t.semibold(8.8),
+                        Color32::from_rgb(255, 208, 102),
+                    );
                 }
 
                 if resp.double_clicked() {
@@ -2112,13 +2475,15 @@ fn show_right_panel(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                         },
                     );
                 }
-                // TAB 2: EFECTOS — Organizado en 7 tarjetas claras: (1) Efectos Mágicos IA, (2) Borrar Objetos IA, (3) Filtros Especiales (LUTs Creativos), (4) Agente IA (Antigravity / Astra), (5) Presencia y Textura, (6) Viñeta, (7) Grano de película
+                // TAB 2: EFECTOS — Organizado en tarjetas claras: Efectos Mágicos IA, Borrar Objetos IA, Filtros Especiales, SmartSky 4K (100 Cielos IA), Overlays (200), Agente IA, Presencia y Textura, Viñeta, Grano
                 2 => {
                     show_magic_effects_card(app, ui, &t, &d);
                     ui.add_space(gap);
                     show_object_eraser_card(app, ui, &t, &d);
                     ui.add_space(gap);
                     show_special_filters_card(app, ui, &t, &d);
+                    ui.add_space(gap);
+                    show_smart_sky_card(app, ui, &t, &d);
                     ui.add_space(gap);
                     show_overlays_card(app, ui, &t, &d);
                     ui.add_space(gap);
@@ -5008,7 +5373,7 @@ fn show_special_filters_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tok
             ui.painter().text(
                 btn_list.center(),
                 Align2::CENTER_CENTER,
-                if list_mode { "🎴 Tarjetas" } else { "☰ Lista" },
+                if list_mode { "▦ Tarjetas" } else { "☰ Lista" },
                 t.semibold(9.8),
                 if list_mode { Color32::from_rgb(255, 225, 155) } else { Color32::from_rgb(220, 224, 234) },
             );
@@ -5546,15 +5911,811 @@ fn show_special_filters_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tok
 }
 
 // =============================================================================
-// CREATIVE OVERLAYS SUB-AREA (150 HIGH-RES OVERLAYS: 5 TYPES × 30 PER TYPE)
+// SMARTSKY 4K SUB-AREA (100 4K SKIES ACROSS 7 CATEGORIES + AI RELIGHTING)
 // =============================================================================
-const OVERLAY_UI_CATEGORIES: &[(&str, &str)] = &[
-    ("all", "✨ Todos"),
-    ("leaks", "🔥 Fugas Luz"),
-    ("bokeh", "✨ Bokeh"),
-    ("sunbeams", "☀️ Rayos Sol"),
-    ("prism", "💎 Prisma"),
-    ("cinema", "🎬 Cine/Clima"),
+const SKY_UI_CATEGORIES: &[(&str, &str, Icon)] = &[
+    ("all", "Todos", Icon::Presets),
+    ("clear", "Azules (2)", Icon::Sun),
+    ("clouds", "Nubes (30)", Icon::Sky),
+    ("overcast", "Nublado (20)", Icon::Cloud),
+    ("rainbow", "Arcoíris (10)", Icon::Curve),
+    ("night", "Noche (8)", Icon::Moon),
+    ("psychedelic", "Psicodélico", Icon::Star),
+    ("sunset", "Atardecer (20)", Icon::GradeHighlights),
+];
+
+fn show_smart_sky_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d: &DevelopSettings) {
+    let catalog = lightcraft_pipeline::smart_sky::catalog();
+    let card_folded = app.ui.section_folded("studio:smartSky");
+
+    let cat_id = egui::Id::new("studio-sky-cat");
+    let search_open_id = egui::Id::new("studio-sky-search-open");
+    let search_q_id = egui::Id::new("studio-sky-search-q");
+    let fav_only_id = egui::Id::new("studio-sky-fav-only");
+    let list_mode_id = egui::Id::new("studio-sky-list-mode");
+    let page_offset_id = egui::Id::new("studio-sky-page-offset");
+    let drag_sky_id = egui::Id::new("studio-sky-drag-active");
+
+    let cur_cat: usize = ui
+        .ctx()
+        .data(|dd| dd.get_temp::<usize>(cat_id))
+        .unwrap_or(0)
+        .min(SKY_UI_CATEGORIES.len() - 1);
+    let mut search_open: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(search_open_id)).unwrap_or(false);
+    let mut search_q: String = ui.ctx().data(|dd| dd.get_temp::<String>(search_q_id)).unwrap_or_default();
+    let mut fav_only: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(fav_only_id)).unwrap_or(false);
+    let mut list_mode: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(list_mode_id)).unwrap_or(false);
+    let mut drag_on: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(drag_sky_id)).unwrap_or(false);
+
+    let active_idx = d.sky.preset.round() as u16;
+    let active_spec = if (1..=100).contains(&active_idx) {
+        catalog.get((active_idx - 1) as usize)
+    } else {
+        None
+    };
+
+    let fav_count = catalog
+        .iter()
+        .filter(|e| app.session.profile_favorites.contains(&e.id))
+        .count();
+    if fav_only && fav_count == 0 {
+        fav_only = false;
+        ui.ctx().data_mut(|dd| dd.insert_temp(fav_only_id, false));
+    }
+
+    let w = ui.available_width();
+    let pad = 10.0;
+    let inner_w = (w - pad * 2.0).max(120.0);
+
+    egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(36, 38, 44, 192))
+        .stroke(Stroke::new(
+            1.0,
+            if active_spec.is_some() {
+                Color32::from_rgb(98, 188, 255).gamma_multiply(0.75)
+            } else {
+                Color32::from_white_alpha(26)
+            },
+        ))
+        .corner_radius(CornerRadius::same(16))
+        .show(ui, |ui| {
+            ui.set_width(w);
+
+            // 1. Header Bar
+            let (hdr_r, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
+
+            let btn_list = Rect::from_min_size(pos2(hdr_r.right() - pad - 56.0, hdr_r.center().y - 10.5), vec2(56.0, 21.0));
+            let btn_fav = Rect::from_min_size(pos2(btn_list.left() - 4.0 - 44.0, hdr_r.center().y - 10.5), vec2(44.0, 21.0));
+            let btn_search = Rect::from_min_size(pos2(btn_fav.left() - 4.0 - 26.0, hdr_r.center().y - 10.5), vec2(26.0, 21.0));
+            let hdr_click_r = Rect::from_min_max(hdr_r.min, pos2(btn_search.left() - 4.0, hdr_r.max.y));
+
+            let hdr_resp = ui
+                .interact(hdr_click_r, egui::Id::new("studio-sky-hdr-fold"), Sense::click())
+                .on_hover_text("Clic para contraer / expandir SmartSky 4K (Beta — Función Experimental)");
+
+            paint(
+                ui.painter(),
+                Rect::from_center_size(pos2(hdr_r.left() + 13.0, hdr_r.center().y), vec2(12.0, 12.0)),
+                if card_folded { Icon::ChevronRight } else { Icon::ChevronDown },
+                Color32::from_rgb(225, 228, 236),
+            );
+            paint(
+                ui.painter(),
+                Rect::from_center_size(pos2(hdr_r.left() + 27.0, hdr_r.center().y), vec2(14.5, 14.5)),
+                Icon::Sky,
+                if active_spec.is_some() {
+                    Color32::from_rgb(98, 196, 255)
+                } else {
+                    Color32::from_rgb(245, 192, 98)
+                },
+            );
+            ui.painter().text(
+                pos2(hdr_r.left() + 40.0, hdr_r.center().y),
+                Align2::LEFT_CENTER,
+                "SmartSky 4K (Beta)",
+                t.semibold(12.5),
+                Color32::WHITE,
+            );
+
+            // Search button
+            let s_resp = ui
+                .interact(btn_search, egui::Id::new("studio-sky-btn-search"), Sense::click())
+                .on_hover_text("Buscar cielo 4K por nombre o atmósfera");
+            ui.painter().rect(
+                btn_search,
+                CornerRadius::same(8),
+                if search_open || !search_q.is_empty() {
+                    Color32::from_rgb(98, 188, 255).gamma_multiply(0.34)
+                } else if s_resp.hovered() {
+                    Color32::from_white_alpha(28)
+                } else {
+                    Color32::from_white_alpha(15)
+                },
+                Stroke::new(
+                    1.0,
+                    if search_open || !search_q.is_empty() {
+                        Color32::from_rgb(98, 188, 255)
+                    } else {
+                        Color32::from_white_alpha(32)
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            paint(
+                ui.painter(),
+                Rect::from_center_size(btn_search.center(), vec2(12.0, 12.0)),
+                Icon::Search,
+                if search_open || !search_q.is_empty() {
+                    Color32::from_rgb(185, 232, 255)
+                } else {
+                    Color32::from_rgb(218, 222, 232)
+                },
+            );
+            if s_resp.clicked() {
+                search_open = !search_open;
+                ui.ctx().data_mut(|dd| dd.insert_temp(search_open_id, search_open));
+                if card_folded {
+                    app.ui.toggle_folded("studio:smartSky");
+                }
+            }
+
+            // Favorites button
+            let f_resp = ui
+                .interact(btn_fav, egui::Id::new("studio-sky-btn-fav"), Sense::click())
+                .on_hover_text("Mostrar solo tus Cielos 4K favoritos (★)");
+            ui.painter().rect(
+                btn_fav,
+                CornerRadius::same(8),
+                if fav_only {
+                    Color32::from_rgb(98, 188, 255).gamma_multiply(0.34)
+                } else if f_resp.hovered() {
+                    Color32::from_white_alpha(28)
+                } else {
+                    Color32::from_white_alpha(15)
+                },
+                Stroke::new(
+                    1.0,
+                    if fav_only { Color32::from_rgb(98, 188, 255) } else { Color32::from_white_alpha(32) },
+                ),
+                StrokeKind::Inside,
+            );
+            let fav_label = if fav_count > 0 { format!("★ {fav_count}") } else { "★ Fav".to_string() };
+            ui.painter().text(
+                btn_fav.center(),
+                Align2::CENTER_CENTER,
+                fav_label,
+                t.semibold(9.8),
+                if fav_only { Color32::from_rgb(185, 232, 255) } else { Color32::from_rgb(220, 224, 234) },
+            );
+            if f_resp.clicked() && fav_count > 0 {
+                fav_only = !fav_only;
+                ui.ctx().data_mut(|dd| {
+                    dd.insert_temp(fav_only_id, fav_only);
+                    dd.insert_temp(page_offset_id, 0.0f32);
+                });
+                if card_folded {
+                    app.ui.toggle_folded("studio:smartSky");
+                }
+            }
+
+            // List vs Cards button
+            let l_resp = ui
+                .interact(btn_list, egui::Id::new("studio-sky-btn-list"), Sense::click())
+                .on_hover_text(if list_mode {
+                    "Volver al carrusel de tarjetas de cielos 4K"
+                } else {
+                    "Ver lista compacta de los 100 Cielos 4K"
+                });
+            ui.painter().rect(
+                btn_list,
+                CornerRadius::same(8),
+                if list_mode {
+                    Color32::from_rgb(98, 188, 255).gamma_multiply(0.34)
+                } else if l_resp.hovered() {
+                    Color32::from_white_alpha(28)
+                } else {
+                    Color32::from_white_alpha(15)
+                },
+                Stroke::new(
+                    1.0,
+                    if list_mode { Color32::from_rgb(98, 188, 255) } else { Color32::from_white_alpha(32) },
+                ),
+                StrokeKind::Inside,
+            );
+            ui.painter().text(
+                btn_list.center(),
+                Align2::CENTER_CENTER,
+                if list_mode { "▦ Tarjetas" } else { "☰ Lista" },
+                t.semibold(9.8),
+                if list_mode { Color32::from_rgb(185, 232, 255) } else { Color32::from_rgb(220, 224, 234) },
+            );
+            if l_resp.clicked() {
+                list_mode = !list_mode;
+                ui.ctx().data_mut(|dd| dd.insert_temp(list_mode_id, list_mode));
+                if card_folded {
+                    app.ui.toggle_folded("studio:smartSky");
+                }
+            } else if hdr_resp.clicked() {
+                app.ui.toggle_folded("studio:smartSky");
+            }
+
+            if card_folded {
+                return;
+            }
+
+            // 2. Optional Search Bar
+            if search_open {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: pad as i8, right: pad as i8, top: 2, bottom: 4 })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let te = egui::TextEdit::singleline(&mut search_q)
+                                .hint_text("Buscar Cúmulos, Atardecer, Vía Láctea, Arcoíris, Aurora, Tormenta…")
+                                .desired_width(inner_w - 28.0);
+                            let resp = ui.add(te);
+                            if resp.changed() {
+                                ui.ctx().data_mut(|dd| {
+                                    dd.insert_temp(search_q_id, search_q.clone());
+                                    dd.insert_temp(page_offset_id, 0.0f32);
+                                });
+                            }
+                            if ui.small_button("✕").on_hover_text("Limpiar búsqueda").clicked() {
+                                search_q.clear();
+                                ui.ctx().data_mut(|dd| {
+                                    dd.insert_temp(search_q_id, search_q.clone());
+                                    dd.insert_temp(page_offset_id, 0.0f32);
+                                });
+                            }
+                        });
+                    });
+            }
+
+            // 3. 2-Row Category Filter Pills (4 pills per row = 8 pills: Todos + 7 categories)
+            let cat_gap = 4.0;
+            let cat_row_h = 23.0;
+            let (cat_area, _) = ui.allocate_exact_size(vec2(w, cat_row_h * 2.0 + cat_gap + 4.0), Sense::hover());
+            let w4 = (inner_w - cat_gap * 3.0) / 4.0;
+            for (idx, (cid, clabel, cicon)) in SKY_UI_CATEGORIES.iter().enumerate() {
+                let row = idx / 4;
+                let col = idx % 4;
+                let x = cat_area.left() + pad + col as f32 * (w4 + cat_gap);
+                let y = cat_area.top() + 1.0 + row as f32 * (cat_row_h + cat_gap);
+                let pill_r = Rect::from_min_size(pos2(x, y), vec2(w4, cat_row_h));
+                let resp = ui
+                    .interact(pill_r, egui::Id::new(("sky-cat-pill", *cid)), Sense::click())
+                    .on_hover_text(match *cid {
+                        "all" => "100 Cielos en 4K con integración inteligente de bordes y re-iluminación (Beta)",
+                        "clear" => "2 Cielos Azules despejados sin nubes en 4K",
+                        "clouds" => "30 Cielos con Nubes (cúmulos, cirros, bodas, verano)",
+                        "overcast" => "20 Cielos Muy Nublados y dramáticos",
+                        "rainbow" => "10 Cielos con Arcoíris reales y dobles",
+                        "night" => "8 Cielos de Noche con Estrellas y Vía Láctea",
+                        "psychedelic" => "10 Cielos Psicodélicos, Auroras Boreales y Fantasía",
+                        _ => "20 Atardeceres de Puesta de Sol y Hora Dorada",
+                    });
+                let active = cur_cat == idx;
+                ui.painter().rect(
+                    pill_r,
+                    CornerRadius::same(7),
+                    if active {
+                        Color32::from_rgb(98, 192, 255)
+                    } else if resp.hovered() {
+                        Color32::from_white_alpha(28)
+                    } else {
+                        Color32::from_white_alpha(13)
+                    },
+                    Stroke::new(
+                        1.0,
+                        if active { Color32::from_rgb(178, 228, 255) } else { Color32::from_white_alpha(26) },
+                    ),
+                    StrokeKind::Inside,
+                );
+                let fg_col = if active { Color32::from_rgb(16, 20, 28) } else { Color32::from_rgb(222, 226, 235) };
+                paint(
+                    ui.painter(),
+                    Rect::from_center_size(pos2(pill_r.left() + 10.0, pill_r.center().y), vec2(10.0, 10.0)),
+                    *cicon,
+                    fg_col,
+                );
+                ui.painter().text(
+                    pos2(pill_r.center().x + 5.0, pill_r.center().y),
+                    Align2::CENTER_CENTER,
+                    *clabel,
+                    if active { t.semibold(8.7) } else { t.font(8.6) },
+                    fg_col,
+                );
+                if resp.clicked() {
+                    ui.ctx().data_mut(|dd| {
+                        dd.insert_temp(cat_id, idx);
+                        dd.insert_temp(page_offset_id, 0.0f32);
+                    });
+                }
+            }
+
+            let q_norm = search_q.trim().to_ascii_lowercase();
+            let sel_cat_id = SKY_UI_CATEGORIES[cur_cat].0;
+            let filtered: Vec<&lightcraft_pipeline::smart_sky::SkySpec> = catalog
+                .iter()
+                .filter(|e| {
+                    if cur_cat != 0 && e.category.id() != sel_cat_id {
+                        return false;
+                    }
+                    if fav_only && !app.session.profile_favorites.contains(&e.id) {
+                        return false;
+                    }
+                    if !q_norm.is_empty() {
+                        let m_name = e.name.to_ascii_lowercase().contains(&q_norm);
+                        let m_sub = e.subtitle.to_ascii_lowercase().contains(&q_norm);
+                        let m_cat = e.category.label().to_ascii_lowercase().contains(&q_norm);
+                        if !m_name && !m_sub && !m_cat {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            if filtered.is_empty() {
+                let (empty_r, _) = ui.allocate_exact_size(vec2(w, 42.0), Sense::hover());
+                ui.painter().text(
+                    empty_r.center(),
+                    Align2::CENTER_CENTER,
+                    "No se encontraron Cielos 4K con ese filtro.",
+                    t.font(10.5),
+                    Color32::from_rgb(185, 190, 202),
+                );
+                return;
+            }
+
+            // 4A. Visual Horizontal Scrollable Card Carousel
+            if !list_mode {
+                let total = filtered.len();
+                let (nav_r, _) = ui.allocate_exact_size(vec2(w, 22.0), Sense::hover());
+                let prev_r = Rect::from_min_size(pos2(nav_r.left() + pad, nav_r.top() + 1.0), vec2(26.0, 20.0));
+                let next_r = Rect::from_min_size(pos2(nav_r.right() - pad - 26.0, nav_r.top() + 1.0), vec2(26.0, 20.0));
+                let prev_resp = ui
+                    .interact(prev_r, egui::Id::new("sky-carousel-prev"), Sense::click())
+                    .on_hover_text("Deslizar Cielos 4K a la izquierda");
+                let next_resp = ui
+                    .interact(next_r, egui::Id::new("sky-carousel-next"), Sense::click())
+                    .on_hover_text("Deslizar Cielos 4K a la derecha");
+
+                for (btn_r, resp, sym) in [(prev_r, &prev_resp, "‹"), (next_r, &next_resp, "›")] {
+                    ui.painter().rect(
+                        btn_r,
+                        CornerRadius::same(6),
+                        if resp.hovered() { Color32::from_white_alpha(30) } else { Color32::from_white_alpha(14) },
+                        Stroke::new(1.0, Color32::from_white_alpha(28)),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        btn_r.center(),
+                        Align2::CENTER_CENTER,
+                        sym,
+                        t.semibold(13.0),
+                        Color32::WHITE,
+                    );
+                }
+
+                let cat_title = SKY_UI_CATEGORIES[cur_cat].1;
+                ui.painter().text(
+                    nav_r.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{cat_title} · {total} Cielos 4K"),
+                    t.font(9.8),
+                    Color32::from_rgb(196, 208, 224),
+                );
+
+                let card_gap = 6.0;
+                let card_w = ((inner_w - card_gap * 2.0) / 3.15).clamp(78.0, 108.0);
+                let card_h = 86.0;
+                let step_px = (card_w + card_gap) * 3.0;
+                let mut scroll_delta_x = 0.0f32;
+                if prev_resp.clicked() {
+                    scroll_delta_x = -step_px;
+                }
+                if next_resp.clicked() {
+                    scroll_delta_x = step_px;
+                }
+
+                let mut clicked_sky: Option<u16> = None;
+                let mut toggled_fav: Option<String> = None;
+
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: pad as i8, right: pad as i8, top: 2, bottom: 4 })
+                    .show(ui, |ui| {
+                        let mut sa = egui::ScrollArea::horizontal()
+                            .id_salt(("studio-sky-cards-hscroll", cur_cat, fav_only))
+                            .max_height(card_h + 10.0)
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
+
+                        if scroll_delta_x != 0.0 {
+                            let cur_off = ui.ctx().data(|dd| dd.get_temp::<f32>(page_offset_id)).unwrap_or(0.0);
+                            let max_off = ((total as f32) * (card_w + card_gap) - inner_w).max(0.0);
+                            let next_off = (cur_off + scroll_delta_x).clamp(0.0, max_off);
+                            ui.ctx().data_mut(|dd| dd.insert_temp(page_offset_id, next_off));
+                            sa = sa.horizontal_scroll_offset(next_off);
+                        }
+
+                        let out = sa.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = card_gap;
+                                for entry in &filtered {
+                                    let (card_r, card_resp) = ui.allocate_exact_size(vec2(card_w, card_h), Sense::click());
+                                    let is_active = active_idx == entry.index;
+                                    let is_fav = app.session.profile_favorites.contains(&entry.id);
+
+                                    let fav_r = Rect::from_min_size(pos2(card_r.right() - 20.0, card_r.top() + 3.0), vec2(17.0, 17.0));
+                                    let over_fav = card_resp.hover_pos().is_some_and(|p| fav_r.contains(p));
+
+                                    let _zen = Color32::from_rgb(entry.zenith_rgb[0], entry.zenith_rgb[1], entry.zenith_rgb[2]);
+                                    let _hor = Color32::from_rgb(entry.horizon_rgb[0], entry.horizon_rgb[1], entry.horizon_rgb[2]);
+                                    let _cld = Color32::from_rgb(entry.cloud_rgb[0], entry.cloud_rgb[1], entry.cloud_rgb[2]);
+
+                                    ui.painter().rect_filled(card_r, CornerRadius::same(10), Color32::from_rgb(18, 20, 26));
+
+                                    // Sky Banner Preview (top 50px) with 4K Nano Banana photographic thumbnail
+                                    let banner_r = Rect::from_min_size(card_r.min, vec2(card_w, 50.0));
+                                    let thumb_tex = nano_banana_card_texture(ui.ctx(), true, entry.index);
+                                    ui.painter().image(
+                                        thumb_tex.id(),
+                                        banner_r,
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+
+                                    // 4K + Index badge
+                                    let badge_r = Rect::from_min_size(pos2(card_r.left() + 5.0, card_r.top() + 5.0), vec2(38.0, 14.0));
+                                    ui.painter().rect_filled(badge_r, CornerRadius::same(4), Color32::from_black_alpha(170));
+                                    ui.painter().text(
+                                        badge_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        format!("4K #{:02}", entry.index),
+                                        t.semibold(7.8),
+                                        Color32::from_rgb(165, 224, 255),
+                                    );
+
+                                    // Favorite star
+                                    ui.painter().text(
+                                        fav_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        if is_fav { "★" } else { "☆" },
+                                        t.semibold(11.0),
+                                        if is_fav { Color32::from_rgb(255, 208, 76) } else { Color32::from_white_alpha(150) },
+                                    );
+
+                                    let short_name: String = entry.name.chars().take(14).collect();
+                                    let title_str = if is_active { format!("✓ {short_name}") } else { short_name };
+                                    ui.painter().text(
+                                        pos2(card_r.center().x, banner_r.bottom() + 11.0),
+                                        Align2::CENTER_CENTER,
+                                        title_str,
+                                        if is_active { t.semibold(9.5) } else { t.font(9.3) },
+                                        if is_active { Color32::from_rgb(165, 228, 255) } else { Color32::WHITE },
+                                    );
+                                    let short_sub: String = entry.subtitle.chars().take(16).collect();
+                                    ui.painter().text(
+                                        pos2(card_r.center().x, card_r.bottom() - 8.0),
+                                        Align2::CENTER_CENTER,
+                                        short_sub,
+                                        t.font(7.9),
+                                        Color32::from_rgb(168, 176, 192),
+                                    );
+
+                                    ui.painter().rect_stroke(
+                                        card_r,
+                                        CornerRadius::same(10),
+                                        Stroke::new(
+                                            if is_active { 2.0 } else if card_resp.hovered() { 1.4 } else { 1.0 },
+                                            if is_active {
+                                                Color32::from_rgb(98, 196, 255)
+                                            } else if card_resp.hovered() {
+                                                Color32::from_white_alpha(120)
+                                            } else {
+                                                Color32::from_white_alpha(26)
+                                            },
+                                        ),
+                                        StrokeKind::Inside,
+                                    );
+
+                                    let card_resp = card_resp.on_hover_text(format!(
+                                        "{} (4K UHD) — {}\nCategoría: {}\nClic para reemplazar el cielo con integración automática de bordes y re-iluminación.",
+                                        entry.name,
+                                        entry.subtitle,
+                                        entry.category.label()
+                                    ));
+
+                                    if card_resp.hovered() && !is_active {
+                                        let mut preview = d.clone();
+                                        preview.sky.preset = entry.index as f64;
+                                        if preview.sky.amount <= 0.0 {
+                                            preview.sky.amount = 100.0;
+                                        }
+                                        app.hover_preview = Some(crate::HoverPreview {
+                                            label: format!("SmartSky 4K: {}", entry.name),
+                                            settings: preview,
+                                        });
+                                    }
+
+                                    if card_resp.clicked() {
+                                        if over_fav {
+                                            toggled_fav = Some(entry.id.clone());
+                                        } else {
+                                            clicked_sky = Some(entry.index);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                        ui.ctx().data_mut(|dd| dd.insert_temp(page_offset_id, out.state.offset.x));
+                    });
+
+                if let Some(fid) = toggled_fav {
+                    let _ = app.run("profile.favorite", json!({"id": fid}));
+                } else if let Some(idx_clicked) = clicked_sky {
+                    ensure_active_photo(app);
+                    if active_idx == idx_clicked {
+                        let _ = app.run("develop.set", json!({"control": "sky.preset", "value": 0.0}));
+                        app.toast(ui.ctx(), "SmartSky desactivado");
+                    } else {
+                        let amt = if d.sky.amount <= 0.0 || (d.sky.amount - 88.0).abs() < 0.5 { 100.0 } else { d.sky.amount };
+                        let _ = app.run("develop.set", json!({"values": {"sky.preset": idx_clicked as f64, "sky.amount": amt}}));
+                        if let Some(sp) = catalog.get((idx_clicked - 1) as usize) {
+                            app.toast(ui.ctx(), format!("Cielo 4K aplicado: {}", sp.name));
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                }
+            } else {
+                // 4B. Compact Full List Mode
+                let mut clicked_sky: Option<u16> = None;
+                let mut toggled_fav: Option<String> = None;
+
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin { left: pad as i8, right: pad as i8, top: 2, bottom: 4 })
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("studio-sky-full-list-scroll")
+                            .max_height(210.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for entry in &filtered {
+                                    let is_active = active_idx == entry.index;
+                                    let is_fav = app.session.profile_favorites.contains(&entry.id);
+                                    let (row_r, row_resp) = ui.allocate_exact_size(vec2(inner_w - 6.0, 25.0), Sense::click());
+                                    let fav_r = Rect::from_min_size(pos2(row_r.right() - 24.0, row_r.top() + 2.0), vec2(20.0, 21.0));
+                                    let over_fav = row_resp.hover_pos().is_some_and(|p| fav_r.contains(p));
+
+                                    ui.painter().rect(
+                                        row_r,
+                                        CornerRadius::same(6),
+                                        if is_active {
+                                            Color32::from_rgb(98, 192, 255).gamma_multiply(0.26)
+                                        } else if row_resp.hovered() {
+                                            Color32::from_white_alpha(22)
+                                        } else {
+                                            Color32::from_white_alpha(9)
+                                        },
+                                        Stroke::new(
+                                            1.0,
+                                            if is_active { Color32::from_rgb(98, 192, 255) } else { Color32::from_white_alpha(18) },
+                                        ),
+                                        StrokeKind::Inside,
+                                    );
+
+                                    let hor = Color32::from_rgb(entry.horizon_rgb[0], entry.horizon_rgb[1], entry.horizon_rgb[2]);
+                                    ui.painter().circle_filled(pos2(row_r.left() + 12.0, row_r.center().y), 4.5, hor);
+
+                                    let title_txt = if is_active {
+                                        format!("✓ #{} {} — {}", entry.index, entry.name, entry.subtitle)
+                                    } else {
+                                        format!("#{} {} — {}", entry.index, entry.name, entry.subtitle)
+                                    };
+                                    let short_t: String = title_txt.chars().take(36).collect();
+                                    ui.painter().text(
+                                        pos2(row_r.left() + 22.0, row_r.center().y),
+                                        Align2::LEFT_CENTER,
+                                        short_t,
+                                        if is_active { t.semibold(10.2) } else { t.font(10.0) },
+                                        if is_active { Color32::from_rgb(175, 228, 255) } else { Color32::from_rgb(235, 238, 245) },
+                                    );
+
+                                    ui.painter().text(
+                                        fav_r.center(),
+                                        Align2::CENTER_CENTER,
+                                        if is_fav { "★" } else { "☆" },
+                                        t.semibold(11.5),
+                                        if is_fav { Color32::from_rgb(255, 204, 72) } else { Color32::from_white_alpha(120) },
+                                    );
+
+                                    if row_resp.hovered() && !is_active {
+                                        let mut preview = d.clone();
+                                        preview.sky.preset = entry.index as f64;
+                                        if preview.sky.amount <= 0.0 {
+                                            preview.sky.amount = 100.0;
+                                        }
+                                        app.hover_preview = Some(crate::HoverPreview {
+                                            label: format!("SmartSky 4K: {}", entry.name),
+                                            settings: preview,
+                                        });
+                                    }
+
+                                    if row_resp.clicked() {
+                                        if over_fav {
+                                            toggled_fav = Some(entry.id.clone());
+                                        } else {
+                                            clicked_sky = Some(entry.index);
+                                        }
+                                    }
+                                }
+                            });
+                    });
+
+                if let Some(fid) = toggled_fav {
+                    let _ = app.run("profile.favorite", json!({"id": fid}));
+                } else if let Some(idx_clicked) = clicked_sky {
+                    ensure_active_photo(app);
+                    if active_idx == idx_clicked {
+                        let _ = app.run("develop.set", json!({"control": "sky.preset", "value": 0.0}));
+                    } else {
+                        let amt = if d.sky.amount <= 0.0 || (d.sky.amount - 88.0).abs() < 0.5 { 100.0 } else { d.sky.amount };
+                        let _ = app.run("develop.set", json!({"values": {"sky.preset": idx_clicked as f64, "sky.amount": amt}}));
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
+
+            // 5. Interactive SmartSky Refinement & AI Relighting Parameters when a sky is active
+            if let Some(active_entry) = active_spec {
+                ui.add_space(4.0);
+                let (act_r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+                let off_r = Rect::from_min_size(pos2(act_r.right() - pad - 66.0, act_r.center().y - 10.0), vec2(66.0, 20.0));
+                let off_resp = ui
+                    .interact(off_r, egui::Id::new("sky-active-disable"), Sense::click())
+                    .on_hover_text("Restaurar el cielo original de la foto");
+
+                ui.painter().text(
+                    pos2(act_r.left() + pad, act_r.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("✓ 4K: {}", active_entry.name),
+                    t.semibold(10.5),
+                    Color32::from_rgb(155, 224, 255),
+                );
+                ui.painter().rect(
+                    off_r,
+                    CornerRadius::same(6),
+                    if off_resp.hovered() { Color32::from_white_alpha(32) } else { Color32::from_white_alpha(16) },
+                    Stroke::new(1.0, Color32::from_white_alpha(32)),
+                    StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    off_r.center(),
+                    Align2::CENTER_CENTER,
+                    "✕ Quitar",
+                    t.semibold(9.5),
+                    Color32::from_rgb(240, 200, 200),
+                );
+                if off_resp.clicked() {
+                    let _ = app.run("develop.set", json!({"control": "sky.preset", "value": 0.0}));
+                    ui.ctx().data_mut(|dd| dd.insert_temp(drag_sky_id, false));
+                    app.toast(ui.ctx(), "Cielo original restaurado");
+                }
+
+                // Direct Manipulation Bar: [Mover Cielo] [Voltear H] [Auto-Integrar] [Centrar]
+                let (manip_r, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
+                let g = 4.0;
+                let bw = (inner_w - g * 3.0) / 4.0;
+                let flip_h = d.sky.flip_x >= 0.5;
+                let actions = [
+                    ("drag", Icon::Target, "Mover", drag_on, "Arrastra directamente sobre la foto para acomodar el cielo 4K"),
+                    ("fliph", Icon::Flip, "Voltear", flip_h, "Invertir horizontalmente la dirección de la luz y las nubes"),
+                    ("auto", Icon::Presets, "Auto IA", false, "Ajuste óptimo automático de bordes, horizonte y re-iluminación"),
+                    ("reset", Icon::Rotate, "Centrar", false, "Restablecer posición y zoom del cielo"),
+                ];
+                for (i, (aid, aicon, albl, is_on, atip)) in actions.iter().enumerate() {
+                    let bx = manip_r.left() + pad + i as f32 * (bw + g);
+                    let br = Rect::from_min_size(pos2(bx, manip_r.top() + 1.0), vec2(bw, 23.0));
+                    let bresp = ui.interact(br, egui::Id::new(("sky-manip-btn", *aid)), Sense::click()).on_hover_text(*atip);
+                    ui.painter().rect(
+                        br,
+                        CornerRadius::same(6),
+                        if *is_on {
+                            Color32::from_rgb(98, 212, 168).gamma_multiply(0.32)
+                        } else if bresp.hovered() {
+                            Color32::from_white_alpha(28)
+                        } else {
+                            Color32::from_white_alpha(14)
+                        },
+                        Stroke::new(
+                            1.0,
+                            if *is_on { Color32::from_rgb(98, 212, 168) } else { Color32::from_white_alpha(26) },
+                        ),
+                        StrokeKind::Inside,
+                    );
+                    let fg_col = if *is_on { Color32::from_rgb(175, 245, 215) } else { Color32::from_rgb(225, 228, 236) };
+                    paint(
+                        ui.painter(),
+                        Rect::from_center_size(pos2(br.left() + 11.0, br.center().y), vec2(10.5, 10.5)),
+                        *aicon,
+                        fg_col,
+                    );
+                    ui.painter().text(
+                        pos2(br.center().x + 5.5, br.center().y),
+                        Align2::CENTER_CENTER,
+                        *albl,
+                        if *is_on { t.semibold(9.1) } else { t.font(9.0) },
+                        fg_col,
+                    );
+                    if bresp.clicked() {
+                        match *aid {
+                            "drag" => {
+                                drag_on = !drag_on;
+                                if drag_on {
+                                    app.ui.tool.clear();
+                                    ui.ctx().data_mut(|dd| {
+                                        dd.insert_temp(egui::Id::new("studio-eraser-active"), false);
+                                        dd.insert_temp(egui::Id::new("studio-overlay-drag-active"), false);
+                                    });
+                                }
+                                ui.ctx().data_mut(|dd| dd.insert_temp(drag_sky_id, drag_on));
+                            }
+                            "fliph" => {
+                                let _ = app.run("develop.set", json!({"control": "sky.flipX", "value": if flip_h { 0.0 } else { 1.0 }}));
+                            }
+                            "auto" => {
+                                let _ = app.run("develop.set", json!({"values": {
+                                    "sky.amount": 100.0,
+                                    "sky.horizonBlend": 45.0,
+                                    "sky.edgeRefine": 85.0,
+                                    "sky.relight": 58.0,
+                                    "sky.haze": 20.0
+                                }}));
+                                app.toast(ui.ctx(), "Integración y re-iluminación IA optimizadas");
+                            }
+                            _ => {
+                                let _ = app.run("develop.set", json!({"values": {
+                                    "sky.posX": 0.0,
+                                    "sky.posY": 0.0,
+                                    "sky.scale": 100.0,
+                                    "sky.horizonPos": 0.0
+                                }}));
+                            }
+                        }
+                    }
+                }
+
+                studio_control(app, ui, d, "sky.amount", "Intensidad del Cielo");
+                studio_control(app, ui, d, "sky.relight", "Re-iluminar Escena IA");
+                studio_control(app, ui, d, "sky.edgeRefine", "Refinar Bordes (Ramas/Pelo)");
+                studio_control(app, ui, d, "sky.horizonBlend", "Transición Horizonte");
+                studio_control(app, ui, d, "sky.horizonPos", "Altura del Horizonte");
+                studio_control(app, ui, d, "sky.haze", "Bruma Atmosférica");
+                studio_control(app, ui, d, "sky.defocus", "Desenfoque de Lente (Bokeh)");
+                studio_control(app, ui, d, "sky.warmth", "Temperatura / Calidez");
+                studio_control(app, ui, d, "sky.brightness", "Exposición del Cielo");
+                studio_control(app, ui, d, "sky.scale", "Escala / Zoom del Cielo");
+                studio_control(app, ui, d, "sky.posX", "Desplazar Cielo X");
+                studio_control(app, ui, d, "sky.posY", "Desplazar Cielo Y");
+            }
+
+            ui.add_space(4.0);
+        });
+}
+
+// =============================================================================
+// CREATIVE OVERLAYS SUB-AREA (200 HIGH-RES OVERLAYS ACROSS 9 CATEGORIES)
+// =============================================================================
+const OVERLAY_UI_CATEGORIES: &[(&str, &str, Icon)] = &[
+    ("all", "Todos", Icon::Presets),
+    ("leaks", "Fugas Luz", Icon::GradeHighlights),
+    ("bokeh", "Bokeh", Icon::Star),
+    ("sunbeams", "Rayos Sol", Icon::Sun),
+    ("prism", "Prisma", Icon::Presets),
+    ("cinema", "Cine/Clima", Icon::Filmstrip),
+    ("birds", "Pájaros", Icon::Sky),
+    ("rainbows", "Arcoíris", Icon::Curve),
+    ("sunglow", "Sol", Icon::Sun),
+    ("clouds", "Nubes", Icon::Cloud),
 ];
 
 fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d: &DevelopSettings) {
@@ -5582,7 +6743,7 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
     let mut drag_on: bool = ui.ctx().data(|dd| dd.get_temp::<bool>(drag_ovl_id)).unwrap_or(false);
 
     let active_idx = d.overlay.preset.round() as u16;
-    let active_spec = if (1..=150).contains(&active_idx) {
+    let active_spec = if (1..=200).contains(&active_idx) {
         catalog.get((active_idx - 1) as usize)
     } else {
         None
@@ -5611,38 +6772,36 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                 Color32::from_white_alpha(26)
             },
         ))
-        .corner_radius(CornerRadius::same(13))
+        .corner_radius(CornerRadius::same(16))
         .show(ui, |ui| {
             ui.set_width(w);
 
             // 1. Header Bar
-            let header_h = 36.0;
-            let (hdr_r, hdr_resp) = ui.allocate_exact_size(vec2(w, header_h), Sense::click());
+            let (hdr_r, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
 
-            let btn_list = Rect::from_min_size(pos2(hdr_r.right() - pad - 60.0, hdr_r.center().y - 11.0), vec2(60.0, 22.0));
-            let btn_fav = Rect::from_min_size(pos2(btn_list.left() - 5.0 - 44.0, hdr_r.center().y - 11.0), vec2(44.0, 22.0));
-            let btn_search = Rect::from_min_size(pos2(btn_fav.left() - 5.0 - 26.0, hdr_r.center().y - 11.0), vec2(26.0, 22.0));
+            let btn_list = Rect::from_min_size(pos2(hdr_r.right() - pad - 56.0, hdr_r.center().y - 10.5), vec2(56.0, 21.0));
+            let btn_fav = Rect::from_min_size(pos2(btn_list.left() - 4.0 - 44.0, hdr_r.center().y - 10.5), vec2(44.0, 21.0));
+            let btn_search = Rect::from_min_size(pos2(btn_fav.left() - 4.0 - 26.0, hdr_r.center().y - 10.5), vec2(26.0, 21.0));
+            let hdr_click_r = Rect::from_min_max(hdr_r.min, pos2(btn_search.left() - 4.0, hdr_r.max.y));
 
-            let caret = if card_folded { "▸" } else { "▾" };
-            ui.painter().text(
-                pos2(hdr_r.left() + pad + 4.0, hdr_r.center().y),
-                Align2::LEFT_CENTER,
-                caret,
-                t.semibold(12.0),
-                t.text,
+            let hdr_resp = ui
+                .interact(hdr_click_r, egui::Id::new("studio-ovl-hdr-fold"), Sense::click())
+                .on_hover_text("Clic para contraer / expandir Overlays 4K");
+
+            paint(
+                ui.painter(),
+                Rect::from_center_size(pos2(hdr_r.left() + 13.0, hdr_r.center().y), vec2(12.0, 12.0)),
+                if card_folded { Icon::ChevronRight } else { Icon::ChevronDown },
+                Color32::from_rgb(225, 228, 236),
             );
-            let icon_c = pos2(hdr_r.left() + pad + 21.0, hdr_r.center().y);
-            ui.painter().circle_filled(
-                icon_c,
-                5.5,
-                if active_spec.is_some() {
-                    Color32::from_rgb(245, 198, 112)
-                } else {
-                    Color32::from_rgb(168, 178, 198)
-                },
+            paint(
+                ui.painter(),
+                Rect::from_center_size(pos2(hdr_r.left() + 27.0, hdr_r.center().y), vec2(14.5, 14.5)),
+                Icon::GradeHighlights,
+                Color32::from_rgb(245, 192, 98),
             );
             ui.painter().text(
-                pos2(hdr_r.left() + pad + 35.0, hdr_r.center().y),
+                pos2(hdr_r.left() + 40.0, hdr_r.center().y),
                 Align2::LEFT_CENTER,
                 "Overlays",
                 t.semibold(13.0),
@@ -5673,7 +6832,16 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                 ),
                 StrokeKind::Inside,
             );
-            ui.painter().text(btn_search.center(), Align2::CENTER_CENTER, "🔍", t.font(10.5), Color32::WHITE);
+            paint(
+                ui.painter(),
+                Rect::from_center_size(btn_search.center(), vec2(12.0, 12.0)),
+                Icon::Search,
+                if search_open || !search_q.is_empty() {
+                    Color32::from_rgb(255, 225, 155)
+                } else {
+                    Color32::from_rgb(218, 222, 232)
+                },
+            );
             if s_resp.clicked() {
                 search_open = !search_open;
                 ui.ctx().data_mut(|dd| dd.insert_temp(search_open_id, search_open));
@@ -5728,7 +6896,7 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                 .on_hover_text(if list_mode {
                     "Volver al carrusel deslizable de tarjetas visuales"
                 } else {
-                    "Ver lista compacta de los 150 Overlays"
+                    "Ver lista compacta de los 200 Overlays"
                 });
             ui.painter().rect(
                 btn_list,
@@ -5749,7 +6917,7 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
             ui.painter().text(
                 btn_list.center(),
                 Align2::CENTER_CENTER,
-                if list_mode { "🎴 Tarjetas" } else { "☰ Lista" },
+                if list_mode { "▦ Tarjetas" } else { "☰ Lista" },
                 t.semibold(9.8),
                 if list_mode { Color32::from_rgb(255, 225, 155) } else { Color32::from_rgb(220, 224, 234) },
             );
@@ -5774,7 +6942,7 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let te = egui::TextEdit::singleline(&mut search_q)
-                                .hint_text("🔍 Buscar Kodak, Bokeh, Rayos, Prisma, Anamórfico, Nieve…")
+                                .hint_text("Buscar Kodak, Bokeh, Rayos, Prisma, Pájaros, Arcoíris, Nubes…")
                                 .desired_width(inner_w - 28.0);
                             let resp = ui.add(te);
                             if resp.changed() {
@@ -5796,26 +6964,30 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                     });
             }
 
-            // 3. 2-Row Category Filter Pills (3 pills per row = 6 pills: Todos + 5 categories of 30 overlays)
-            let cat_gap = 4.0;
-            let cat_row_h = 24.0;
+            // 3. 2-Row Category Filter Pills (5 pills per row = 10 pills: Todos + 9 categories = 200 overlays)
+            let cat_gap = 3.5;
+            let cat_row_h = 23.0;
             let (cat_area, _) = ui.allocate_exact_size(vec2(w, cat_row_h * 2.0 + cat_gap + 4.0), Sense::hover());
-            let w3 = (inner_w - cat_gap * 2.0) / 3.0;
-            for (idx, (cid, clabel)) in OVERLAY_UI_CATEGORIES.iter().enumerate() {
-                let row = idx / 3;
-                let col = idx % 3;
-                let x = cat_area.left() + pad + col as f32 * (w3 + cat_gap);
+            let w5 = (inner_w - cat_gap * 4.0) / 5.0;
+            for (idx, (cid, clabel, cicon)) in OVERLAY_UI_CATEGORIES.iter().enumerate() {
+                let row = idx / 5;
+                let col = idx % 5;
+                let x = cat_area.left() + pad + col as f32 * (w5 + cat_gap);
                 let y = cat_area.top() + 1.0 + row as f32 * (cat_row_h + cat_gap);
-                let pill_r = Rect::from_min_size(pos2(x, y), vec2(w3, cat_row_h));
+                let pill_r = Rect::from_min_size(pos2(x, y), vec2(w5, cat_row_h));
                 let resp = ui
                     .interact(pill_r, egui::Id::new(("ovl-cat-pill", *cid)), Sense::click())
                     .on_hover_text(match *cid {
-                        "all" => "150 Overlays ópticos en alta resolución (30 por categoría)",
+                        "all" => "200 Overlays ópticos y atmosféricos en alta resolución",
                         "leaks" => "30 Fugas de Luz analógicas (Kodak, Portra, Super 8, Sunset)",
                         "bokeh" => "30 Overlays de Bokeh Dorado, Esferas 85mm f/1.2 y Partículas",
                         "sunbeams" => "30 Overlays de Rayos de Sol Volumétricos y Atmósfera",
                         "prism" => "30 Overlays de Prisma de Cristal, Cáusticas y Halación Cinestill",
-                        _ => "30 Overlays de Destellos Anamórficos, Estrellas y Clima (Lluvia/Nieve)",
+                        "cinema" => "30 Overlays de Destellos Anamórficos, Estrellas y Clima (Lluvia/Nieve)",
+                        "birds" => "10 Overlays de Pájaros Volando (Bandadas, Gaviotas, Palomas Nupciales)",
+                        "rainbows" => "10 Overlays de Arcoíris Reales, Dobles y Pastel",
+                        "sunglow" => "10 Overlays de Sol con su Resplandor y Estrella Solar",
+                        _ => "20 Overlays de Nubes Volumétricas, Cirros y Niebla",
                     });
                 let active = cur_cat == idx;
                 ui.painter().rect(
@@ -5834,12 +7006,19 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                     ),
                     StrokeKind::Inside,
                 );
+                let fg_col = if active { Color32::from_rgb(22, 22, 26) } else { Color32::from_rgb(222, 226, 235) };
+                paint(
+                    ui.painter(),
+                    Rect::from_center_size(pos2(pill_r.left() + 8.5, pill_r.center().y), vec2(9.5, 9.5)),
+                    *cicon,
+                    fg_col,
+                );
                 ui.painter().text(
-                    pill_r.center(),
+                    pos2(pill_r.center().x + 4.5, pill_r.center().y),
                     Align2::CENTER_CENTER,
                     *clabel,
-                    if active { t.semibold(9.9) } else { t.font(9.8) },
-                    if active { Color32::from_rgb(22, 22, 26) } else { Color32::from_rgb(222, 226, 235) },
+                    if active { t.semibold(8.3) } else { t.font(8.2) },
+                    fg_col,
                 );
                 if resp.clicked() {
                     ui.ctx().data_mut(|dd| {
@@ -5918,7 +7097,7 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                 ui.painter().text(
                     nav_r.center(),
                     Align2::CENTER_CENTER,
-                    format!("{cat_title} · {total} Overlays HD (desliza ⇄)"),
+                    format!("{cat_title} · {total} Overlays 4K"),
                     t.font(9.8),
                     Color32::from_rgb(196, 202, 214),
                 );
@@ -6048,17 +7227,36 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                                                 Stroke::new(1.5, ca.gamma_multiply(0.75)),
                                             );
                                         }
+                                        lightcraft_pipeline::overlays::OverlayCategory::Birds
+                                        | lightcraft_pipeline::overlays::OverlayCategory::Rainbows
+                                        | lightcraft_pipeline::overlays::OverlayCategory::SunGlow
+                                        | lightcraft_pipeline::overlays::OverlayCategory::Clouds => {
+                                            let thumb_tex = nano_banana_card_texture(ui.ctx(), false, entry.index);
+                                            ui.painter().image(
+                                                thumb_tex.id(),
+                                                banner_r,
+                                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                                Color32::WHITE,
+                                            );
+                                        }
                                     }
 
-                                    // Index badge (#01..#30)
-                                    let num_in_cat = ((entry.index - 1) % 30) + 1;
-                                    let badge_r = Rect::from_min_size(pos2(card_r.left() + 5.0, card_r.top() + 5.0), vec2(28.0, 14.0));
+                                    // Index badge
+                                    let is_4k_ovl = entry.index >= 151;
+                                    let badge_r = Rect::from_min_size(
+                                        pos2(card_r.left() + 5.0, card_r.top() + 5.0),
+                                        vec2(if is_4k_ovl { 42.0 } else { 30.0 }, 14.0),
+                                    );
                                     ui.painter().rect_filled(badge_r, CornerRadius::same(4), Color32::from_black_alpha(165));
                                     ui.painter().text(
                                         badge_r.center(),
                                         Align2::CENTER_CENTER,
-                                        format!("#{num_in_cat:02}"),
-                                        t.semibold(8.2),
+                                        if is_4k_ovl {
+                                            format!("4K #{:02}", entry.index)
+                                        } else {
+                                            format!("#{:02}", entry.index)
+                                        },
+                                        t.semibold(7.8),
                                         acc,
                                     );
 
@@ -6290,20 +7488,20 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                     app.toast(ui.ctx(), "Overlay quitado");
                 }
 
-                // Quick Direct Manipulation Bar: [🖐 Mover en foto] [⇄ Espejo H] [⇅ Espejo V] [↻ +90°] [🎯 Centrar]
+                // Quick Direct Manipulation Bar: [Mover] [Esp H] [Esp V] [+90°] [Centrar]
                 let (manip_r, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
                 let g = 4.0;
                 let bw = (inner_w - g * 4.0) / 5.0;
                 let flip_h = d.overlay.flip_x >= 0.5;
                 let flip_v = d.overlay.flip_y >= 0.5;
                 let actions = [
-                    ("drag", "🖐 Mover", drag_on, "Arrastra directamente sobre la foto con el ratón para colocar el Overlay"),
-                    ("fliph", "⇄ Esp H", flip_h, "Voltear el Overlay horizontalmente"),
-                    ("flipv", "⇅ Esp V", flip_v, "Voltear el Overlay verticalmente"),
-                    ("rot90", "↻ +90°", false, "Girar el Overlay 90 grados"),
-                    ("reset", "🎯 Centrar", false, "Restablecer posición, tamaño y rotación del Overlay"),
+                    ("drag", Icon::Target, "Mover", drag_on, "Arrastra directamente sobre la foto con el ratón para colocar el Overlay"),
+                    ("fliph", Icon::Flip, "Esp H", flip_h, "Voltear el Overlay horizontalmente"),
+                    ("flipv", Icon::Flip, "Esp V", flip_v, "Voltear el Overlay verticalmente"),
+                    ("rot90", Icon::Rotate, "+90°", false, "Girar el Overlay 90 grados"),
+                    ("reset", Icon::RotateDrag, "Centrar", false, "Restablecer posición, tamaño y rotación del Overlay"),
                 ];
-                for (i, (aid, albl, is_on, atip)) in actions.iter().enumerate() {
+                for (i, (aid, aicon, albl, is_on, atip)) in actions.iter().enumerate() {
                     let bx = manip_r.left() + pad + i as f32 * (bw + g);
                     let br = Rect::from_min_size(pos2(bx, manip_r.top() + 1.0), vec2(bw, 23.0));
                     let bresp = ui.interact(br, egui::Id::new(("ovl-manip-btn", *aid)), Sense::click()).on_hover_text(*atip);
@@ -6323,12 +7521,19 @@ fn show_overlays_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, d:
                         ),
                         StrokeKind::Inside,
                     );
+                    let fg_col = if *is_on { Color32::from_rgb(175, 245, 215) } else { Color32::from_rgb(225, 228, 236) };
+                    paint(
+                        ui.painter(),
+                        Rect::from_center_size(pos2(br.left() + 8.5, br.center().y), vec2(10.0, 10.0)),
+                        *aicon,
+                        fg_col,
+                    );
                     ui.painter().text(
-                        br.center(),
+                        pos2(br.center().x + 5.0, br.center().y),
                         Align2::CENTER_CENTER,
                         *albl,
-                        if *is_on { t.semibold(9.2) } else { t.font(9.1) },
-                        if *is_on { Color32::from_rgb(175, 245, 215) } else { Color32::from_rgb(225, 228, 236) },
+                        if *is_on { t.semibold(9.0) } else { t.font(8.9) },
+                        fg_col,
                     );
                     if bresp.clicked() {
                         match *aid {
@@ -6430,6 +7635,9 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
     let card_folded = app.ui.section_folded("studio:objectEraser");
     let eraser_id = egui::Id::new("studio-eraser-active");
     let mut eraser_on = ui.ctx().data(|dd| dd.get_temp::<bool>(eraser_id)).unwrap_or(false);
+    if eraser_on && !matches!(app.ui.tool.as_str(), "fill" | "heal" | "clone") {
+        app.ui.tool = "fill".into();
+    }
     let spot_count = d.spots.len();
 
     let w = ui.available_width();
@@ -6505,18 +7713,25 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                 ),
                 StrokeKind::Inside,
             );
+            let tog_fg = if eraser_on { Color32::from_rgb(190, 255, 225) } else { Color32::from_rgb(225, 228, 236) };
+            paint(
+                ui.painter(),
+                Rect::from_center_size(pos2(toggle_r.left() + 12.0, toggle_r.center().y), vec2(11.5, 11.5)),
+                Icon::Brush,
+                tog_fg,
+            );
             ui.painter().text(
-                toggle_r.center(),
+                pos2(toggle_r.center().x + 6.0, toggle_r.center().y),
                 Align2::CENTER_CENTER,
-                if eraser_on { "🖌 Brocha ON" } else { "🖌 Usar Brocha" },
-                t.semibold(9.8),
-                if eraser_on { Color32::from_rgb(190, 255, 225) } else { Color32::from_rgb(225, 228, 236) },
+                if eraser_on { "Brocha ON" } else { "Usar Brocha" },
+                t.semibold(9.5),
+                tog_fg,
             );
 
             if tog_resp.clicked() {
                 eraser_on = !eraser_on;
                 if eraser_on {
-                    if !matches!(app.ui.tool.as_str(), "fill" | "remove" | "clone") {
+                    if !matches!(app.ui.tool.as_str(), "fill" | "heal" | "clone") {
                         app.ui.tool = "fill".into();
                     }
                     ui.ctx().data_mut(|dd| {
@@ -6536,7 +7751,7 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                 return;
             }
 
-            // 1. Mode Selector Pills: [✨ Eliminar IA (LaMa)] [🩹 Curar (Heal LAB)] [🎯 Clonar]
+            // 1. Mode Selector Pills: [Eliminar IA (LaMa)] [Curar (Heal LAB)] [Clonar]
             let cur_mode = match app.ui.tool.as_str() {
                 "remove" | "heal" => "heal",
                 "clone" => "clone",
@@ -6546,11 +7761,11 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
             let (mode_area, _) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
             let mw = (inner_w - mode_gap * 2.0) / 3.0;
             let modes = [
-                ("fill", "✨ Eliminar IA", "Eliminar con IA (LaMa Inpainting Local): recorta el bounding-box con 40% de margen de contexto (512/1024px) y reconstruye con feather de 8px + grano ISO"),
-                ("heal", "🩹 Curar (Heal)", "Modo Heal de Separación de Frecuencias (Pirámide Laplaciana High/Low-Pass) + Corrección Estadística de Color en espacio LAB"),
-                ("clone", "🎯 Clonar", "Tampón de clonar exacto desde punto de origen"),
+                ("fill", Icon::Presets, "Eliminar IA", "Eliminar con IA (LaMa Inpainting Local): recorta el bounding-box con 40% de margen de contexto (512/1024px) y reconstruye con feather de 8px + grano ISO"),
+                ("heal", Icon::Eraser, "Curar (Heal)", "Modo Heal de Separación de Frecuencias (Pirámide Laplaciana High/Low-Pass) + Corrección Estadística de Color en espacio LAB"),
+                ("clone", Icon::Target, "Clonar", "Tampón de clonar exacto desde punto de origen"),
             ];
-            for (idx, (m_id, m_lbl, m_tip)) in modes.iter().enumerate() {
+            for (idx, (m_id, m_icon, m_lbl, m_tip)) in modes.iter().enumerate() {
                 let x = mode_area.left() + pad + idx as f32 * (mw + mode_gap);
                 let pill_r = Rect::from_min_size(pos2(x, mode_area.top() + 2.0), vec2(mw, 24.0));
                 let resp = ui.interact(pill_r, egui::Id::new(("studio-eraser-mode", *m_id)), Sense::click()).on_hover_text(*m_tip);
@@ -6571,13 +7786,51 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                     ),
                     StrokeKind::Inside,
                 );
-                ui.painter().text(
-                    pill_r.center(),
-                    Align2::CENTER_CENTER,
-                    *m_lbl,
-                    if active { t.semibold(9.9) } else { t.font(9.8) },
-                    if active { Color32::from_rgb(22, 22, 26) } else { Color32::from_rgb(222, 226, 235) },
-                );
+                let fg_col = if active { Color32::from_rgb(22, 22, 26) } else { Color32::from_rgb(222, 226, 235) };
+                if *m_id == "fill" {
+                    paint(
+                        ui.painter(),
+                        Rect::from_center_size(pos2(pill_r.left() + 8.5, pill_r.center().y), vec2(10.0, 10.0)),
+                        *m_icon,
+                        fg_col,
+                    );
+                    ui.painter().text(
+                        pos2(pill_r.left() + 15.0, pill_r.center().y),
+                        Align2::LEFT_CENTER,
+                        *m_lbl,
+                        if active { t.semibold(8.7) } else { t.font(8.7) },
+                        fg_col,
+                    );
+                    let badge_r = Rect::from_center_size(pos2(pill_r.right() - 14.5, pill_r.center().y), vec2(23.0, 12.0));
+                    ui.painter().rect(
+                        badge_r,
+                        CornerRadius::same(4),
+                        if active { Color32::from_rgb(28, 30, 36) } else { Color32::from_rgb(245, 198, 112).gamma_multiply(0.24) },
+                        Stroke::new(0.8, if active { Color32::from_rgb(65, 70, 82) } else { Color32::from_rgb(245, 198, 112).gamma_multiply(0.7) }),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        badge_r.center(),
+                        Align2::CENTER_CENTER,
+                        "BETA",
+                        t.semibold(6.4),
+                        if active { Color32::from_rgb(252, 214, 138) } else { Color32::from_rgb(248, 212, 142) },
+                    );
+                } else {
+                    paint(
+                        ui.painter(),
+                        Rect::from_center_size(pos2(pill_r.left() + 11.0, pill_r.center().y), vec2(11.0, 11.0)),
+                        *m_icon,
+                        fg_col,
+                    );
+                    ui.painter().text(
+                        pos2(pill_r.center().x + 5.5, pill_r.center().y),
+                        Align2::CENTER_CENTER,
+                        *m_lbl,
+                        if active { t.semibold(9.6) } else { t.font(9.5) },
+                        fg_col,
+                    );
+                }
                 if resp.clicked() {
                     app.ui.tool = (*m_id).into();
                     eraser_on = true;
@@ -6586,9 +7839,6 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                         dd.insert_temp(egui::Id::new("studio-mask-brush-active"), false);
                         dd.insert_temp(egui::Id::new("studio-magic-drag-mask"), false);
                     });
-                    if app.session.active_spot.is_some() {
-                        let _ = app.run("spot.update", json!({"mode": *m_id}));
-                    }
                 }
             }
 
@@ -6637,9 +7887,6 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                     let frac = (*pval / 1000.0).clamp(0.001, 0.25);
                     app.ui.remove_size = frac;
                     app.ui.brush_size = (*pval / 400.0).clamp(0.002, 0.35);
-                    if app.session.active_spot.is_some() {
-                        let _ = app.run("spot.update", json!({"size": frac}));
-                    }
                 }
             }
 
@@ -6660,9 +7907,6 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                 let frac = ((v / 1000.0) as f32).clamp(0.001, 0.25);
                 app.ui.remove_size = frac;
                 app.ui.brush_size = ((v / 400.0) as f32).clamp(0.002, 0.35);
-                if app.session.active_spot.is_some() {
-                    let _ = app.run("spot.update", json!({"size": frac}));
-                }
                 Ok(json!(null))
             });
 
@@ -6670,9 +7914,6 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
             studio_slider_spec(app, ui, &s_feather, app.ui.remove_feather as f64, "Difuminar orillas (%)", |app, v| {
                 let v32 = (v as f32).clamp(0.0, 100.0);
                 app.ui.remove_feather = v32;
-                if app.session.active_spot.is_some() {
-                    let _ = app.run("spot.update", json!({"feather": v}));
-                }
                 Ok(json!(null))
             });
 
@@ -6680,24 +7921,54 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
             studio_slider_spec(app, ui, &s_opac, app.ui.remove_opacity as f64, "Opacidad de borrado (%)", |app, v| {
                 let v32 = (v as f32).clamp(10.0, 100.0);
                 app.ui.remove_opacity = v32;
-                if app.session.active_spot.is_some() {
-                    let _ = app.run("spot.update", json!({"opacity": v}));
-                }
                 Ok(json!(null))
             });
 
-            // 4. Action Buttons: [✦ Auto-Manchas] [↻ Nuevo Parche] [↩ Deshacer] [🗑 Limpiar]
+            // 3b. Optional Generative AI Prompt (Auto-Prompt Inteligente by default)
+            if cur_mode == "fill" {
+                ui.add_space(4.0);
+                let prompt_id = egui::Id::new("studio-eraser-custom-prompt");
+                let mut custom_prompt = ui.ctx().data(|dd| dd.get_temp::<String>(prompt_id)).unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    std::fs::read_to_string(format!("{home}/.mm-studio/ai_prompt.txt"))
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    let te_resp = ui
+                        .add_sized(
+                            vec2(inner_w, 22.0),
+                            egui::TextEdit::singleline(&mut custom_prompt)
+                                .hint_text("✨ Prompt IA (vacío = Auto: bosque, playa, cielo…)")
+                                .font(t.font(9.5)),
+                        )
+                        .on_hover_text(
+                            "Opcional: déjalo vacío para que el Auto-Prompt Inteligente detecte automáticamente si es bosque, playa, cielo o interior; o escribe qué quieres generar (ej. 'pine tree branches and sky')",
+                        );
+                    if te_resp.changed() {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        let dir = format!("{home}/.mm-studio");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(format!("{dir}/ai_prompt.txt"), custom_prompt.trim());
+                    }
+                    ui.ctx().data_mut(|dd| dd.insert_temp(prompt_id, custom_prompt));
+                });
+            }
+
+            // 4. Action Buttons: [Manchas] [Otro parche] [Último] [Todos]
             ui.add_space(4.0);
             let (act_area, _) = ui.allocate_exact_size(vec2(w, 26.0), Sense::hover());
             let agap = 4.0;
             let aw = (inner_w - agap * 3.0) / 4.0;
             let actions = [
-                ("auto", "✦ Manchas", "Detectar y limpiar manchas de sensor o polvo automáticamente"),
-                ("reseed", "↻ Otro parche", "Probar otra reconstrucción IA para el objeto seleccionado"),
-                ("undo", "↩ Último", "Eliminar el último trazo de borrado"),
-                ("clear", "🗑 Todos", "Eliminar todos los trazos de borrado en esta foto"),
+                ("auto", Icon::Circle, "Manchas", "Detectar y limpiar manchas de sensor o polvo automáticamente"),
+                ("reseed", Icon::Rotate, "Otro parche", "Probar otra reconstrucción IA para el objeto seleccionado"),
+                ("undo", Icon::Back, "Último", "Eliminar el último trazo de borrado"),
+                ("clear", Icon::Trash, "Todos", "Eliminar todos los trazos de borrado en esta foto"),
             ];
-            for (idx, (aid, albl, atip)) in actions.iter().enumerate() {
+            for (idx, (aid, aicon, albl, atip)) in actions.iter().enumerate() {
                 let x = act_area.left() + pad + idx as f32 * (aw + agap);
                 let ar = Rect::from_min_size(pos2(x, act_area.top() + 1.0), vec2(aw, 23.0));
                 let aresp = ui.interact(ar, egui::Id::new(("studio-eraser-act", *aid)), Sense::click()).on_hover_text(*atip);
@@ -6708,12 +7979,19 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                     Stroke::new(1.0, Color32::from_white_alpha(26)),
                     StrokeKind::Inside,
                 );
+                let fg_col = Color32::from_rgb(225, 228, 236);
+                paint(
+                    ui.painter(),
+                    Rect::from_center_size(pos2(ar.left() + 9.0, ar.center().y), vec2(10.5, 10.5)),
+                    *aicon,
+                    fg_col,
+                );
                 ui.painter().text(
-                    ar.center(),
+                    pos2(ar.center().x + 5.0, ar.center().y),
                     Align2::CENTER_CENTER,
                     *albl,
-                    t.font(9.5),
-                    Color32::from_rgb(225, 228, 236),
+                    t.font(9.2),
+                    fg_col,
                 );
                 if aresp.clicked() {
                     ensure_active_photo(app);
@@ -6748,13 +8026,306 @@ fn show_object_eraser_card(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Token
                 }
             }
 
+            // 4b. Cloud Generative Diffusion Engine (Lightroom-level Fill via Fal.ai / OpenAI / Gemini / Stability)
+            ui.add_space(4.0);
+            let ai_cfg_path = std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".mm-studio/ai_keys.json"));
+            let (active_provider, active_api_key, stability_mode, cloud_depleted): (Option<String>, String, String, bool) = ai_cfg_path
+                .as_ref()
+                .and_then(|p| {
+                    let s = std::fs::read_to_string(p).ok()?;
+                    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+                    let key = v.get("api_key")?.as_str()?.trim().to_string();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    let prov = v.get("provider").and_then(|x| x.as_str()).unwrap_or("cloud").to_uppercase();
+                    let smode = v
+                        .get("stability_mode")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("inpaint")
+                        .trim()
+                        .to_ascii_lowercase();
+                    let key_id: String = key.chars().rev().take(8).collect();
+                    let depleted = std::path::Path::new(&format!("/tmp/mm_cloud_skip_{key_id}")).exists();
+                    Some((Some(prov), key, smode, depleted))
+                })
+                .unwrap_or((None, String::new(), "inpaint".to_string(), false));
+            let (cloud_area, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+            let btn_w = if active_provider.is_some() { inner_w - 28.0 } else { inner_w };
+            let cloud_r = Rect::from_min_size(pos2(cloud_area.left() + pad, cloud_area.top() + 1.0), vec2(btn_w, 22.0));
+            let c_resp = ui
+                .interact(cloud_r, egui::Id::new("studio-eraser-cloud-key"), Sense::click())
+                .on_hover_text("Haz clic después de copiar tu API Key (Stability AI, Fal.ai FLUX/Bria, OpenAI gpt-image-1 o Google Gemini) para activar Difusión Generativa real nivel Lightroom");
+            let has_cloud = active_provider.is_some() && !cloud_depleted;
+            ui.painter().rect(
+                cloud_r,
+                CornerRadius::same(6),
+                if has_cloud {
+                    Color32::from_rgb(46, 168, 126).gamma_multiply(if c_resp.hovered() { 0.42 } else { 0.28 })
+                } else if cloud_depleted || c_resp.hovered() {
+                    Color32::from_rgb(245, 198, 112).gamma_multiply(0.26)
+                } else {
+                    Color32::from_white_alpha(12)
+                },
+                Stroke::new(
+                    1.0,
+                    if has_cloud {
+                        Color32::from_rgb(82, 218, 168)
+                    } else {
+                        Color32::from_rgb(245, 198, 112).gamma_multiply(0.65)
+                    },
+                ),
+                StrokeKind::Inside,
+            );
+            let cloud_lbl = if has_cloud {
+                format!("⚡ Motor IA ({}) Activo", active_provider.as_deref().unwrap_or("CLOUD"))
+            } else if cloud_depleted {
+                "⚠️ Sin créditos suficientes (Clic para pegar nueva Key)".to_string()
+            } else {
+                "⚡ Activar Motor IA Generativa 6K Pro (Pegar Key)".to_string()
+            };
+            ui.painter().text(
+                cloud_r.center(),
+                Align2::CENTER_CENTER,
+                &cloud_lbl,
+                t.semibold(9.0),
+                if has_cloud { Color32::from_rgb(165, 250, 215) } else { Color32::from_rgb(245, 212, 145) },
+            );
+            if c_resp.clicked() {
+                if let Ok(out) = std::process::Command::new("pbpaste").output() {
+                    let clip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if clip.len() >= 16 && !clip.contains(' ') && !clip.contains('\n') {
+                        let prov = if clip.starts_with("sk_pr_") || clip.starts_with("sandbox_sk_pr_") {
+                            "photoroom"
+                        } else if clip.starts_with("pk_live_") || clip.starts_with("pk_test_") {
+                            "pixelapi"
+                        } else if clip.starts_with("AIza") || clip.starts_with("AQ.") {
+                            "gemini"
+                        } else if clip.starts_with("sk-proj-") || clip.starts_with("sk-None-") || (clip.starts_with("sk-") && clip.len() > 55) {
+                            "openai"
+                        } else if clip.contains(':') || clip.len() > 60 {
+                            "fal"
+                        } else {
+                            "stability"
+                        };
+                        if let Some(p) = &ai_cfg_path {
+                            if let Some(parent) = p.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if let Ok(entries) = std::fs::read_dir("/tmp") {
+                                for e in entries.flatten() {
+                                    if e.file_name().to_string_lossy().starts_with("mm_cloud_skip_") {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
+                            }
+                            let keep_mode = if stability_mode == "erase" { "erase" } else { "inpaint" };
+                            let payload = json!({
+                                "provider": prov,
+                                "api_key": clip,
+                                "stability_mode": keep_mode
+                            });
+                            let _ = std::fs::write(p, payload.to_string());
+                            ui.ctx().request_repaint();
+                            app.toast(ui.ctx(), format!("API Key Cloud IA ({}) activada", prov.to_uppercase()));
+                        }
+                    } else {
+                        app.toast(ui.ctx(), "Copia primero tu API Key (PhotoRoom / PixelAPI / Stability / OpenAI / Gemini) al portapapeles");
+                    }
+                }
+            }
+            if active_provider.is_some() {
+                let clr_r = Rect::from_min_size(pos2(cloud_r.right() + 4.0, cloud_area.top() + 1.0), vec2(24.0, 22.0));
+                let clr_resp = ui
+                    .interact(clr_r, egui::Id::new("studio-eraser-cloud-clear"), Sense::click())
+                    .on_hover_text("Desactivar API Cloud y usar motor local 6K");
+                ui.painter().rect(
+                    clr_r,
+                    CornerRadius::same(6),
+                    if clr_resp.hovered() { Color32::from_rgb(210, 75, 75).gamma_multiply(0.4) } else { Color32::from_white_alpha(12) },
+                    Stroke::new(1.0, Color32::from_white_alpha(28)),
+                    StrokeKind::Inside,
+                );
+                ui.painter().text(clr_r.center(), Align2::CENTER_CENTER, "X", t.semibold(9.2), Color32::from_rgb(235, 190, 190));
+                if clr_resp.clicked() {
+                    if let Some(p) = &ai_cfg_path {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    ui.ctx().request_repaint();
+                    app.toast(ui.ctx(), "Modo Local 6K activado");
+                }
+            }
+
+            // 4c. Stability AI Model Selector (visible only when Stability AI is the active provider)
+            if active_provider.as_deref() == Some("STABILITY") {
+                ui.add_space(3.0);
+                let (stab_area, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+                let sgap = 4.0;
+                let sw = (inner_w - sgap) / 2.0;
+                let stab_modes = [
+                    (
+                        "inpaint",
+                        "✨ Inpaint Pro · 5 cr",
+                        "Modelo Caro / Ultra Nítido (Stability Inpaint v2 + Auto-Prompt Inteligente): sintetiza textura real de bosque, ramas, hojas, arena y cielo con máxima nitidez (5 créditos por trazo nuevo)",
+                    ),
+                    (
+                        "erase",
+                        "⚡ SDXL Ahorro · 0.2 cr",
+                        "Modelo Económico (Stability SDXL 1.0 Masking v1): cuesta solo ~0.2 créditos por trazo (~25 veces más barato) y funciona incluso cuando te quedan 5 créditos o menos",
+                    ),
+                ];
+                for (sidx, (smode_id, slbl, stip)) in stab_modes.iter().enumerate() {
+                    let is_sel = (stability_mode == "erase" && *smode_id == "erase")
+                        || (stability_mode != "erase" && *smode_id == "inpaint");
+                    let sx = stab_area.left() + pad + sidx as f32 * (sw + sgap);
+                    let sr = Rect::from_min_size(pos2(sx, stab_area.top() + 1.0), vec2(sw, 22.0));
+                    let sresp = ui
+                        .interact(sr, egui::Id::new(("studio-stability-mode", *smode_id)), Sense::click())
+                        .on_hover_text(*stip);
+                    let fill_col = if is_sel {
+                        if *smode_id == "inpaint" {
+                            Color32::from_rgb(46, 168, 126).gamma_multiply(if sresp.hovered() { 0.48 } else { 0.36 })
+                        } else {
+                            Color32::from_rgb(76, 148, 235).gamma_multiply(if sresp.hovered() { 0.48 } else { 0.36 })
+                        }
+                    } else if sresp.hovered() {
+                        Color32::from_white_alpha(24)
+                    } else {
+                        Color32::from_white_alpha(10)
+                    };
+                    let stroke_col = if is_sel {
+                        if *smode_id == "inpaint" {
+                            Color32::from_rgb(92, 228, 178)
+                        } else {
+                            Color32::from_rgb(115, 182, 255)
+                        }
+                    } else {
+                        Color32::from_white_alpha(26)
+                    };
+                    let txt_col = if is_sel {
+                        if *smode_id == "inpaint" {
+                            Color32::from_rgb(185, 255, 225)
+                        } else {
+                            Color32::from_rgb(200, 230, 255)
+                        }
+                    } else {
+                        Color32::from_rgb(175, 182, 195)
+                    };
+                    ui.painter().rect(sr, CornerRadius::same(6), fill_col, Stroke::new(1.0, stroke_col), StrokeKind::Inside);
+                    ui.painter().text(sr.center(), Align2::CENTER_CENTER, *slbl, t.semibold(8.9), txt_col);
+                    if sresp.clicked() && !is_sel {
+                        if let Some(p) = &ai_cfg_path {
+                            let payload = json!({
+                                "provider": "stability",
+                                "api_key": active_api_key,
+                                "stability_mode": *smode_id
+                            });
+                            let _ = std::fs::write(p, payload.to_string());
+                            if let Ok(entries) = std::fs::read_dir("/tmp") {
+                                for e in entries.flatten() {
+                                    if e.file_name().to_string_lossy().starts_with("mm_cloud_skip_") {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                            let msg = if *smode_id == "inpaint" {
+                                "Stability AI: ✨ Inpaint Pro (5 cr · Ultra Nítido) activado"
+                            } else {
+                                "Stability AI: ⚡ SDXL Ahorro (0.2 cr · Económico) activado"
+                            };
+                            app.toast(ui.ctx(), msg);
+                        }
+                    }
+                }
+            } else if matches!(active_provider.as_deref(), Some("PIXELAPI" | "PHOTOROOM")) {
+                ui.add_space(3.0);
+                let (prov_area, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+                let pgap = 4.0;
+                let pw = (inner_w - pgap) / 2.0;
+                let prov_opts = [
+                    (
+                        "pixelapi",
+                        "pk_live_4a1837b99bf3d5bc5eec04f4c6c702b9b5895349122654ac",
+                        "⚡ PixelAPI",
+                        "Motor IA PixelAPI (Remove Object con máscara exacta del pincel)",
+                    ),
+                    (
+                        "photoroom",
+                        "sk_pr_default_d8778474251b674e8fc40c3c15236eccbf5cc101",
+                        "✨ PhotoRoom",
+                        "Motor IA PhotoRoom v2 (con respaldo automático a Sandbox si se agotan tus créditos Live)",
+                    ),
+                ];
+                for (pidx, (p_id, p_key, plbl, ptip)) in prov_opts.iter().enumerate() {
+                    let is_sel = active_provider.as_deref().is_some_and(|ap| ap.eq_ignore_ascii_case(p_id));
+                    let px = prov_area.left() + pad + pidx as f32 * (pw + pgap);
+                    let pr = Rect::from_min_size(pos2(px, prov_area.top() + 1.0), vec2(pw, 22.0));
+                    let presp = ui
+                        .interact(pr, egui::Id::new(("studio-cloud-prov", *p_id)), Sense::click())
+                        .on_hover_text(*ptip);
+                    let fill_col = if is_sel {
+                        if *p_id == "photoroom" {
+                            Color32::from_rgb(132, 92, 245).gamma_multiply(if presp.hovered() { 0.48 } else { 0.36 })
+                        } else {
+                            Color32::from_rgb(46, 168, 126).gamma_multiply(if presp.hovered() { 0.48 } else { 0.36 })
+                        }
+                    } else if presp.hovered() {
+                        Color32::from_white_alpha(24)
+                    } else {
+                        Color32::from_white_alpha(10)
+                    };
+                    let stroke_col = if is_sel {
+                        if *p_id == "photoroom" {
+                            Color32::from_rgb(168, 135, 255)
+                        } else {
+                            Color32::from_rgb(92, 228, 178)
+                        }
+                    } else {
+                        Color32::from_white_alpha(26)
+                    };
+                    let txt_col = if is_sel {
+                        if *p_id == "photoroom" {
+                            Color32::from_rgb(228, 212, 255)
+                        } else {
+                            Color32::from_rgb(185, 255, 225)
+                        }
+                    } else {
+                        Color32::from_rgb(175, 182, 195)
+                    };
+                    ui.painter().rect(pr, CornerRadius::same(6), fill_col, Stroke::new(1.0, stroke_col), StrokeKind::Inside);
+                    ui.painter().text(pr.center(), Align2::CENTER_CENTER, *plbl, t.semibold(8.9), txt_col);
+                    if presp.clicked() && !is_sel {
+                        if let Some(p) = &ai_cfg_path {
+                            let payload = json!({
+                                "provider": *p_id,
+                                "api_key": *p_key,
+                                "stability_mode": stability_mode
+                            });
+                            let _ = std::fs::write(p, payload.to_string());
+                            if let Ok(entries) = std::fs::read_dir("/tmp") {
+                                for e in entries.flatten() {
+                                    if e.file_name().to_string_lossy().starts_with("mm_cloud_skip_") {
+                                        let _ = std::fs::remove_file(e.path());
+                                    }
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                            app.toast(ui.ctx(), format!("Motor IA {} activado", plbl));
+                        }
+                    }
+                }
+            }
+
             if eraser_on {
                 ui.add_space(3.0);
                 let (hint_r, _) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
                 ui.painter().text(
                     hint_r.center(),
                     Align2::CENTER_CENTER,
-                    "💡 Pinta sobre el objeto en la foto · Usa Alt + Rueda para cambiar tamaño",
+                    "Pinta sobre el objeto en la foto · Usa Alt + Rueda para cambiar tamaño",
                     t.font(9.3),
                     Color32::from_rgb(165, 230, 195),
                 );
@@ -6900,6 +8471,8 @@ struct AgentExternalCommand {
     crop_rect: Option<[f64; 4]>,
     #[serde(default)]
     crop_angle: Option<f64>,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
 }
 
 /// Complete Visual QA & Iterative Refinement Report for a photo.
@@ -7134,7 +8707,43 @@ pub fn poll_and_sync_agent_bridge(app: &mut LightcraftApp, ctx: &egui::Context) 
                 cmd.target.as_str()
             };
 
-            if action == "inspect" {
+            if action.starts_with("print.") {
+                let params = cmd.params.clone().unwrap_or_else(|| json!({}));
+                // If an album_name was specified, select its photos first
+                if !cmd.album_name.trim().is_empty() {
+                    let alb_id = app
+                        .session
+                        .catalog
+                        .albums()
+                        .find(|a| a.name.eq_ignore_ascii_case(cmd.album_name.trim()))
+                        .map(|a| a.id);
+                    if let Some(aid) = alb_id {
+                        let ids: Vec<u64> = app.session.catalog.album_photos(aid).into_iter().map(|p| p.0).collect();
+                        if !ids.is_empty() {
+                            let _ = app.run("library.select", json!({"ids": ids, "mode": "replace"}));
+                        }
+                    }
+                }
+                let res = app.run(action, params);
+                app.ui.dialog = Some(crate::state::Dialog::Print);
+                let out = match res {
+                    Ok(v) => json!({
+                        "cmd_id": cmd.cmd_id,
+                        "ok": true,
+                        "action": action,
+                        "result": v,
+                    }),
+                    Err(e) => json!({
+                        "cmd_id": cmd.cmd_id,
+                        "ok": false,
+                        "action": action,
+                        "error": e,
+                    }),
+                };
+                let _ = std::fs::write(dir.join("result.json"), serde_json::to_string(&out).unwrap_or_default());
+                app.toast(ctx, format!("📚 Agente IA ejecutó {action}"));
+                ctx.request_repaint();
+            } else if action == "inspect" {
                 let reports = inspect_target_photos_only(app, target_eff, &cmd.album_name, &cmd.style);
                 let _ = std::fs::write(
                     dir.join("result.json"),

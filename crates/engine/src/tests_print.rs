@@ -336,10 +336,145 @@ fn every_print_command_is_registered_with_a_description() {
         "print.template.save",
         "print.template.apply",
         "print.template.delete",
+        "print.set_format",
+        "print.auto_layout_spread",
+        "print.cycle_layout",
+        "print.export_book",
+        "print.save_project",
+        "print.open_project",
+        "print.cell.panZoom",
     ] {
         let c = crate::find_command(id).unwrap_or_else(|| panic!("{id} missing"));
         assert!(c.params.len() > 3, "{id}");
     }
+}
+
+#[test]
+fn smartalbums_photobook_commands_and_all_three_export_modes() {
+    let mut s = Session::with_demo();
+    let ids: Vec<u64> = s.catalog.photos().take(6).map(|p| p.id.0).collect();
+
+    // 1. Set 12x12" format (open to 12x24" spread), 3.5mm bleed, 12mm safe zone, 12mm gutter, hardcover wrap
+    let fmt = run(
+        &mut s,
+        "print.set_format",
+        json!({
+            "format": "12x12",
+            "spreadMode": true,
+            "bleedMm": 3.5,
+            "safeZoneMm": 12.0,
+            "gutterMm": 12.0,
+            "gapMm": 4.0,
+            "hardcoverWrap": true,
+            "bindingMode": "layflatSpreads",
+        }),
+    );
+    assert_eq!(fmt["settings"]["layout"]["page"]["paper"], "12x24");
+    assert_eq!(fmt["settings"]["job"]["ppi"], 300.0);
+    assert!(s.print.book.spine_width_mm(s.print.layout.pages as usize) >= 2.0);
+
+    // 2. Auto-layout spread 0 with 4 photos
+    let lay = run(
+        &mut s,
+        "print.auto_layout_spread",
+        json!({
+            "spread": 0,
+            "ids": &ids[0..4],
+            "variation": 0,
+        }),
+    );
+    assert_eq!(lay["cellIds"].as_array().unwrap().len(), 4);
+
+    // 3. Cycle layout mathematical permutation
+    let cyc = run(&mut s, "print.cycle_layout", json!({"spread": 0}));
+    assert_eq!(cyc["variation"], 1);
+    assert_eq!(cyc["cellIds"].as_array().unwrap().len(), 4);
+
+    // Use fast 72 PPI for test speed while verifying all 3 export pipelines
+    run(&mut s, "print.set", json!({"job": {"ppi": 72.0}}));
+
+    let dir = std::env::temp_dir().join(format!("lc-smartalbums-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Modo A: Layflat 180° sequential JPG spreads + Portada.jpg
+    let mode_a = run(
+        &mut s,
+        "print.export_book",
+        json!({
+            "path": dir.join("layflat"),
+            "bindingMode": "layflatSpreads",
+            "ids": &ids[0..4],
+        }),
+    );
+    assert_eq!(mode_a["mode"], "layflatSpreads");
+    assert!(dir.join("layflat").join("Pliego_01.jpg").exists());
+    assert!(dir.join("layflat").join("Portada.jpg").exists());
+
+    // Modo B: Commercial Print Sequential PDF (split spreads + gutter + crop marks)
+    let pdf_b = dir.join("Secuencial.pdf");
+    let mode_b = run(
+        &mut s,
+        "print.export_book",
+        json!({
+            "path": &pdf_b,
+            "bindingMode": "sequentialPdf",
+            "cropMarks": true,
+            "ids": &ids[0..4],
+        }),
+    );
+    assert_eq!(mode_b["mode"], "sequentialPdf");
+    assert_eq!(mode_b["pages"], 2);
+    assert!(pdf_b.exists());
+
+    // Modo C: Saddle-Stitch Booklet Imposition (padded to multiple of 4, N+1 Tiro/Retiro pairing)
+    let pdf_c = dir.join("Cuadernillo.pdf");
+    let mode_c = run(
+        &mut s,
+        "print.export_book",
+        json!({
+            "path": &pdf_c,
+            "bindingMode": "saddleStitch",
+            "cropMarks": true,
+            "ids": &ids[0..4],
+        }),
+    );
+    assert_eq!(mode_c["mode"], "saddleStitch");
+    assert_eq!(mode_c["paddedPagesMultipleOf4"], 4);
+    assert_eq!(mode_c["impositionSheets"], 2); // 1 sheet front (Tiro: [4|1]) + 1 sheet back (Retiro: [2|3])
+    assert!(pdf_c.exists());
+
+    // Portable Print Project (.mmbook) round-trip: save on Photographer session -> open on Print Shop session
+    let mmbook_path = dir.join("Boda_Editorial.mmbook");
+    let saved = run(
+        &mut s,
+        "print.save_project",
+        json!({
+            "path": &mmbook_path,
+            "title": "Boda Editorial",
+            "ids": &ids[0..4],
+        }),
+    );
+    assert_eq!(saved["format"], "mmbook-v1");
+    assert_eq!(saved["embeddedPhotos"], 4);
+    assert!(mmbook_path.exists());
+
+    let mut print_shop = Session::new();
+    let opened = run(
+        &mut print_shop,
+        "print.open_project",
+        json!({
+            "path": &mmbook_path,
+        }),
+    );
+    assert_eq!(opened["format"], "mmbook-v1");
+    assert_eq!(opened["title"], "Boda Editorial");
+    assert_eq!(opened["importedPhotos"], 4);
+    assert!(print_shop.print.book.enabled);
+    assert_eq!(print_shop.print.layout.cells.len(), 4);
+    assert!(print_shop.print.layout.cells.iter().all(|c| c.photo.is_some_and(|pid| print_shop.catalog.photo(lightcraft_catalog::PhotoId(pid)).is_some())));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

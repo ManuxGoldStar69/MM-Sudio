@@ -34,7 +34,7 @@ pub const MAX_GRID: usize = 20;
 /// Geometry tolerance, inches (far below one printed pixel at any supported resolution).
 pub const EPS: f64 = 1e-6;
 
-/// Paper sizes by name: portrait width and height in millimetres (ISO) or inches (US/photo).
+/// Paper sizes by name: portrait width and height in millimetres (ISO) or inches (US/photo/photobook).
 const PAPER: &[(&str, f64, f64)] = &[
     ("a3", 297.0 / 25.4, 420.0 / 25.4),
     ("a4", 210.0 / 25.4, 297.0 / 25.4),
@@ -45,6 +45,14 @@ const PAPER: &[(&str, f64, f64)] = &[
     ("4x6", 4.0, 6.0),
     ("5x7", 5.0, 7.0),
     ("8x10", 8.0, 10.0),
+    ("8x8", 8.0, 8.0),
+    ("8x16", 8.0, 16.0),
+    ("10x10", 10.0, 10.0),
+    ("10x20", 10.0, 20.0),
+    ("12x12", 12.0, 12.0),
+    ("12x24", 12.0, 24.0),
+    ("11x14", 11.0, 14.0),
+    ("11x28", 11.0, 28.0),
     ("13x19", 13.0, 19.0),
 ];
 
@@ -264,8 +272,20 @@ impl Default for GridSpec {
     }
 }
 
+fn default_cell_zoom() -> f64 {
+    1.0
+}
+
+fn is_default_zoom(z: &f64) -> bool {
+    (*z - 1.0).abs() < 1e-6
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    v.abs() < 1e-6
+}
+
 /// One cell of a package layout.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct Cell {
     pub id: u32,
@@ -276,6 +296,33 @@ pub struct Cell {
     /// Not part of a saved template.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub photo: Option<u64>,
+    /// Individual zoom factor inside the cell frame (`1.0` = default fit/fill, `1.0..=5.0`).
+    #[serde(default = "default_cell_zoom", skip_serializing_if = "is_default_zoom")]
+    pub zoom: f64,
+    /// Normalized horizontal pan offset inside the cell (`-1.0..=1.0`, `0.0` = centered).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub pan_x: f64,
+    /// Normalized vertical pan offset inside the cell (`-1.0..=1.0`, `0.0` = centered).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub pan_y: f64,
+    /// Optional text caption / title inside or below the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            page: 0,
+            rect: Rect::default(),
+            photo: None,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            caption: None,
+        }
+    }
 }
 
 /// Where a cell goes in the stacking order of its page.
@@ -300,7 +347,7 @@ pub enum Snap {
     Grid,
 }
 
-/// Rulers, grid and guides (Lightroom's Guides panel).
+/// Rulers, grid and pre-press guides (Lightroom's Guides panel + SmartAlbums Pre-Press overlays).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct Guides {
@@ -314,6 +361,18 @@ pub struct Guides {
     pub show_page_grid: bool,
     pub show_cells: bool,
     pub show_dimensions: bool,
+    /// Show solid Trim Line (corte final de guillotina).
+    pub show_trim: bool,
+    /// Show dashed green Safe Zone (zona segura interior de 10–15 mm).
+    pub show_safe_zone: bool,
+    /// Show Center Gutter / Spine Crease (pliegue central 180° o franja sombreada de lomo).
+    pub show_gutter: bool,
+    /// Bleed distance in millimetres (configurable 3.0 to 5.0 mm outward from Trim).
+    pub bleed_mm: f64,
+    /// Safe zone distance in millimetres (configurable 10.0 to 15.0 mm inward from Trim).
+    pub safe_zone_mm: f64,
+    /// Center spine gutter loss in millimetres (configurable 10.0 to 15.0 mm for traditional bound books).
+    pub gutter_mm: f64,
 }
 
 impl Default for Guides {
@@ -328,13 +387,23 @@ impl Default for Guides {
             show_page_grid: false,
             show_cells: true,
             show_dimensions: false,
+            show_trim: true,
+            show_safe_zone: false,
+            show_gutter: false,
+            bleed_mm: 3.0,
+            safe_zone_mm: 12.0,
+            gutter_mm: 12.0,
         }
     }
 }
 
 impl Guides {
     pub fn validate(&self) -> Result<(), String> {
-        check(self.grid_size, "grid size", 0.05, 10.0).map(|_| ())
+        check(self.grid_size, "grid size", 0.05, 10.0)?;
+        check(self.bleed_mm, "bleed_mm", 0.0, 25.0)?;
+        check(self.safe_zone_mm, "safe_zone_mm", 0.0, 50.0)?;
+        check(self.gutter_mm, "gutter_mm", 0.0, 50.0)?;
+        Ok(())
     }
 }
 
@@ -693,7 +762,7 @@ impl Layout {
             }
         };
         let id = self.take_id();
-        self.cells.push(Cell { id, page, rect: Rect::new(at.x, at.y, w, h), photo: None });
+        self.cells.push(Cell { id, page, rect: Rect::new(at.x, at.y, w, h), photo: None, ..Cell::default() });
         Ok(id)
     }
 
@@ -775,6 +844,68 @@ impl Layout {
             c.photo = photo;
         }
         Ok(())
+    }
+
+    /// Updates a cell's individual pan, zoom, and optional text caption.
+    pub fn set_cell_pan_zoom(
+        &mut self,
+        id: u32,
+        pan_x: Option<f64>,
+        pan_y: Option<f64>,
+        zoom: Option<f64>,
+        caption: Option<Option<String>>,
+    ) -> Result<(), String> {
+        let i = self.index(id)?;
+        if let Some(c) = self.cells.get_mut(i) {
+            if let Some(px) = pan_x {
+                if !px.is_finite() {
+                    return Err("panX must be finite".into());
+                }
+                c.pan_x = px.clamp(-1.0, 1.0);
+            }
+            if let Some(py) = pan_y {
+                if !py.is_finite() {
+                    return Err("panY must be finite".into());
+                }
+                c.pan_y = py.clamp(-1.0, 1.0);
+            }
+            if let Some(z) = zoom {
+                if !z.is_finite() {
+                    return Err("zoom must be finite".into());
+                }
+                c.zoom = z.clamp(1.0, 5.0);
+            }
+            if let Some(cap) = caption {
+                c.caption = cap.filter(|s| !s.trim().is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    /// Replaces all cells on `page` (zero-based) with `placed` (`(rect, photo_id)`), growing `pages` if needed.
+    pub fn replace_page_cells(&mut self, page: u32, placed: Vec<(Rect, Option<u64>)>) -> Result<Vec<u32>, String> {
+        if page >= MAX_PAGES {
+            return Err(format!("a layout holds at most {MAX_PAGES} pages"));
+        }
+        self.style = Style::CustomPackage;
+        self.pages = self.pages.max(page + 1);
+        self.cells.retain(|c| c.page != page);
+        let mut ids = Vec::with_capacity(placed.len());
+        for (rect, photo) in placed {
+            if self.cells.len() >= MAX_CELLS {
+                return Err(format!("at most {MAX_CELLS} cells"));
+            }
+            let id = self.take_id();
+            self.cells.push(Cell {
+                id,
+                page,
+                rect,
+                photo,
+                ..Cell::default()
+            });
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Changes a cell's place in the stacking order of its page (Send to Back, Backward, Forward,
@@ -1201,7 +1332,7 @@ mod tests {
     fn auto_layout_failure_changes_nothing() {
         let mut l = package();
         l.add_cell(2.0, 2.0).unwrap();
-        l.cells.push(Cell { id: 50, page: 0, rect: Rect::new(0.25, 0.25, 40.0, 40.0), photo: None });
+        l.cells.push(Cell { id: 50, page: 0, rect: Rect::new(0.25, 0.25, 40.0, 40.0), photo: None, ..Cell::default() });
         let before = l.clone();
         assert!(l.auto_layout().is_err());
         assert_eq!(l, before);
